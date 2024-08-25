@@ -1,10 +1,14 @@
 Format: http://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: synapse
-Source: https://github.com/matrix-org/synapse
+Source: https://github.com/element-hq/synapse
 
 Files: *
 Copyright: 2014-2017, OpenMarket Ltd, 2017-2018 New Vector Ltd
 License: Apache-2.0
+
+Files: *
+Copyright: 2023 New Vector Ltd
+License: AGPL-3.0-or-later
 
 Files: synapse/config/saml2.py
 Copyright: 2015, Ericsson
@@ -20,29 +24,6 @@ License: Apache-2.0
 
 Files: synapse/config/repository.py
 Copyright: 2014-2015, matrix.org
-License: Apache-2.0
-
-Files: contrib/jitsimeetbridge/unjingle/strophe/base64.js
-Copyright: Public Domain (Tyler Akins http://rumkin.com)
-License: public-domain
- This code was written by Tyler Akins and has been placed in the
- public domain.  It would be nice if you left this header intact.
- Base64 code from Tyler Akins -- http://rumkin.com
-
-Files: contrib/jitsimeetbridge/unjingle/strophe/md5.js
-Copyright: 1999-2002, Paul Johnston & Contributors
-License: BSD-3-clause
-
-Files: contrib/jitsimeetbridge/unjingle/strophe/strophe.js
-Copyright: 2006-2008, OGG, LLC
-License: Expat
-
-Files: contrib/jitsimeetbridge/unjingle/strophe/XMLHttpRequest.js
-Copyright: 2010 passive.ly LLC
-License: Expat
-
-Files: contrib/jitsimeetbridge/unjingle/*.js
-Copyright: 2014 Jitsi
 License: Apache-2.0
 
 Files: debian/*

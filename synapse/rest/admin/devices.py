@@ -1,20 +1,29 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2020 Dirk Klimpel
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import logging
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Tuple
 
 from synapse.api.errors import NotFoundError, SynapseError
+from synapse.handlers.device import DeviceHandler
 from synapse.http.servlet import (
     RestServlet,
     assert_params_in_dict,
@@ -41,10 +50,12 @@ class DeviceRestServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
-        self.hs = hs
         self.auth = hs.get_auth()
-        self.device_handler = hs.get_device_handler()
-        self.store = hs.get_datastore()
+        handler = hs.get_device_handler()
+        assert isinstance(handler, DeviceHandler)
+        self.device_handler = handler
+        self.store = hs.get_datastores().main
+        self.is_mine = hs.is_mine
 
     async def on_GET(
         self, request: SynapseRequest, user_id: str, device_id: str
@@ -52,8 +63,8 @@ class DeviceRestServlet(RestServlet):
         await assert_requester_is_admin(self.auth, request)
 
         target_user = UserID.from_string(user_id)
-        if not self.hs.is_mine(target_user):
-            raise SynapseError(400, "Can only lookup local users")
+        if not self.is_mine(target_user):
+            raise SynapseError(HTTPStatus.BAD_REQUEST, "Can only lookup local users")
 
         u = await self.store.get_user_by_id(target_user.to_string())
         if u is None:
@@ -62,7 +73,9 @@ class DeviceRestServlet(RestServlet):
         device = await self.device_handler.get_device(
             target_user.to_string(), device_id
         )
-        return 200, device
+        if device is None:
+            raise NotFoundError("No device found")
+        return HTTPStatus.OK, device
 
     async def on_DELETE(
         self, request: SynapseRequest, user_id: str, device_id: str
@@ -70,15 +83,15 @@ class DeviceRestServlet(RestServlet):
         await assert_requester_is_admin(self.auth, request)
 
         target_user = UserID.from_string(user_id)
-        if not self.hs.is_mine(target_user):
-            raise SynapseError(400, "Can only lookup local users")
+        if not self.is_mine(target_user):
+            raise SynapseError(HTTPStatus.BAD_REQUEST, "Can only lookup local users")
 
         u = await self.store.get_user_by_id(target_user.to_string())
         if u is None:
             raise NotFoundError("Unknown user")
 
-        await self.device_handler.delete_device(target_user.to_string(), device_id)
-        return 200, {}
+        await self.device_handler.delete_devices(target_user.to_string(), [device_id])
+        return HTTPStatus.OK, {}
 
     async def on_PUT(
         self, request: SynapseRequest, user_id: str, device_id: str
@@ -86,8 +99,8 @@ class DeviceRestServlet(RestServlet):
         await assert_requester_is_admin(self.auth, request)
 
         target_user = UserID.from_string(user_id)
-        if not self.hs.is_mine(target_user):
-            raise SynapseError(400, "Can only lookup local users")
+        if not self.is_mine(target_user):
+            raise SynapseError(HTTPStatus.BAD_REQUEST, "Can only lookup local users")
 
         u = await self.store.get_user_by_id(target_user.to_string())
         if u is None:
@@ -97,7 +110,7 @@ class DeviceRestServlet(RestServlet):
         await self.device_handler.update_device(
             target_user.to_string(), device_id, body
         )
-        return 200, {}
+        return HTTPStatus.OK, {}
 
 
 class DevicesRestServlet(RestServlet):
@@ -108,14 +121,12 @@ class DevicesRestServlet(RestServlet):
     PATTERNS = admin_patterns("/users/(?P<user_id>[^/]*)/devices$", "v2")
 
     def __init__(self, hs: "HomeServer"):
-        """
-        Args:
-            hs: server
-        """
-        self.hs = hs
         self.auth = hs.get_auth()
-        self.device_handler = hs.get_device_handler()
-        self.store = hs.get_datastore()
+        handler = hs.get_device_handler()
+        assert isinstance(handler, DeviceHandler)
+        self.device_handler = handler
+        self.store = hs.get_datastores().main
+        self.is_mine = hs.is_mine
 
     async def on_GET(
         self, request: SynapseRequest, user_id: str
@@ -123,15 +134,44 @@ class DevicesRestServlet(RestServlet):
         await assert_requester_is_admin(self.auth, request)
 
         target_user = UserID.from_string(user_id)
-        if not self.hs.is_mine(target_user):
-            raise SynapseError(400, "Can only lookup local users")
+        if not self.is_mine(target_user):
+            raise SynapseError(HTTPStatus.BAD_REQUEST, "Can only lookup local users")
 
         u = await self.store.get_user_by_id(target_user.to_string())
         if u is None:
             raise NotFoundError("Unknown user")
 
         devices = await self.device_handler.get_devices_by_user(target_user.to_string())
-        return 200, {"devices": devices, "total": len(devices)}
+        return HTTPStatus.OK, {"devices": devices, "total": len(devices)}
+
+    async def on_POST(
+        self, request: SynapseRequest, user_id: str
+    ) -> Tuple[int, JsonDict]:
+        """Creates a new device for the user."""
+        await assert_requester_is_admin(self.auth, request)
+
+        target_user = UserID.from_string(user_id)
+        if not self.is_mine(target_user):
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST, "Can only create devices for local users"
+            )
+
+        u = await self.store.get_user_by_id(target_user.to_string())
+        if u is None:
+            raise NotFoundError("Unknown user")
+
+        body = parse_json_object_from_request(request)
+        device_id = body.get("device_id")
+        if not device_id:
+            raise SynapseError(HTTPStatus.BAD_REQUEST, "Missing device_id")
+        if not isinstance(device_id, str):
+            raise SynapseError(HTTPStatus.BAD_REQUEST, "device_id must be a string")
+
+        await self.device_handler.check_device_registered(
+            user_id=user_id, device_id=device_id
+        )
+
+        return HTTPStatus.CREATED, {}
 
 
 class DeleteDevicesRestServlet(RestServlet):
@@ -143,10 +183,12 @@ class DeleteDevicesRestServlet(RestServlet):
     PATTERNS = admin_patterns("/users/(?P<user_id>[^/]*)/delete_devices$", "v2")
 
     def __init__(self, hs: "HomeServer"):
-        self.hs = hs
         self.auth = hs.get_auth()
-        self.device_handler = hs.get_device_handler()
-        self.store = hs.get_datastore()
+        handler = hs.get_device_handler()
+        assert isinstance(handler, DeviceHandler)
+        self.device_handler = handler
+        self.store = hs.get_datastores().main
+        self.is_mine = hs.is_mine
 
     async def on_POST(
         self, request: SynapseRequest, user_id: str
@@ -154,8 +196,8 @@ class DeleteDevicesRestServlet(RestServlet):
         await assert_requester_is_admin(self.auth, request)
 
         target_user = UserID.from_string(user_id)
-        if not self.hs.is_mine(target_user):
-            raise SynapseError(400, "Can only lookup local users")
+        if not self.is_mine(target_user):
+            raise SynapseError(HTTPStatus.BAD_REQUEST, "Can only lookup local users")
 
         u = await self.store.get_user_by_id(target_user.to_string())
         if u is None:
@@ -167,4 +209,4 @@ class DeleteDevicesRestServlet(RestServlet):
         await self.device_handler.delete_devices(
             target_user.to_string(), body["devices"]
         )
-        return 200, {}
+        return HTTPStatus.OK, {}

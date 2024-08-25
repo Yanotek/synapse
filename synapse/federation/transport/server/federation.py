@@ -1,22 +1,40 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 #  Copyright 2021 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import logging
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
+from collections import Counter
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    Union,
+)
 
 from typing_extensions import Literal
 
-import synapse
+from synapse.api.constants import Direction, EduTypes
 from synapse.api.errors import Codes, SynapseError
 from synapse.api.room_versions import RoomVersions
 from synapse.api.urls import FEDERATION_UNSTABLE_PREFIX, FEDERATION_V2_PREFIX
@@ -26,16 +44,24 @@ from synapse.federation.transport.server._base import (
 )
 from synapse.http.servlet import (
     parse_boolean_from_args,
+    parse_integer,
     parse_integer_from_args,
+    parse_string,
     parse_string_from_args,
     parse_strings_from_args,
 )
-from synapse.server import HomeServer
+from synapse.http.site import SynapseRequest
+from synapse.media._base import DEFAULT_MAX_TIMEOUT_MS, MAXIMUM_ALLOWED_MAX_TIMEOUT_MS
+from synapse.media.thumbnailer import ThumbnailProvider
 from synapse.types import JsonDict
+from synapse.util import SYNAPSE_VERSION
 from synapse.util.ratelimitutils import FederationRateLimiter
-from synapse.util.versionstring import get_version_string
+
+if TYPE_CHECKING:
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+issue_8631_logger = logging.getLogger("synapse.8631_debug")
 
 
 class BaseFederationServerServlet(BaseFederationServlet):
@@ -46,7 +72,7 @@ class BaseFederationServerServlet(BaseFederationServlet):
 
     def __init__(
         self,
-        hs: HomeServer,
+        hs: "HomeServer",
         authenticator: Authenticator,
         ratelimiter: FederationRateLimiter,
         server_name: str,
@@ -57,6 +83,7 @@ class BaseFederationServerServlet(BaseFederationServlet):
 
 class FederationSendServlet(BaseFederationServerServlet):
     PATH = "/send/(?P<transaction_id>[^/]*)/?"
+    CATEGORY = "Inbound federation transaction request"
 
     # We ratelimit manually in the handler as we queue up the requests and we
     # don't want to fill up the ratelimiter with blocked requests.
@@ -95,6 +122,23 @@ class FederationSendServlet(BaseFederationServerServlet):
                 len(transaction_data.get("edus", [])),
             )
 
+            if issue_8631_logger.isEnabledFor(logging.DEBUG):
+                DEVICE_UPDATE_EDUS = [
+                    EduTypes.DEVICE_LIST_UPDATE,
+                    EduTypes.SIGNING_KEY_UPDATE,
+                ]
+                device_list_updates = [
+                    edu.get("content", {})
+                    for edu in transaction_data.get("edus", [])
+                    if edu.get("edu_type") in DEVICE_UPDATE_EDUS
+                ]
+                if device_list_updates:
+                    issue_8631_logger.debug(
+                        "received transaction [%s] including device list updates: %s",
+                        transaction_id,
+                        device_list_updates,
+                    )
+
         except Exception as e:
             logger.exception(e)
             return 400, {"error": "Invalid transaction"}
@@ -108,6 +152,7 @@ class FederationSendServlet(BaseFederationServerServlet):
 
 class FederationEventServlet(BaseFederationServerServlet):
     PATH = "/event/(?P<event_id>[^/]*)/?"
+    CATEGORY = "Federation requests"
 
     # This is when someone asks for a data item for a given server data_id pair.
     async def on_GET(
@@ -122,6 +167,7 @@ class FederationEventServlet(BaseFederationServerServlet):
 
 class FederationStateV1Servlet(BaseFederationServerServlet):
     PATH = "/state/(?P<room_id>[^/]*)/?"
+    CATEGORY = "Federation requests"
 
     # This is when someone asks for all data for a given room.
     async def on_GET(
@@ -134,12 +180,13 @@ class FederationStateV1Servlet(BaseFederationServerServlet):
         return await self.handler.on_room_state_request(
             origin,
             room_id,
-            parse_string_from_args(query, "event_id", None, required=False),
+            parse_string_from_args(query, "event_id", None, required=True),
         )
 
 
 class FederationStateIdsServlet(BaseFederationServerServlet):
     PATH = "/state_ids/(?P<room_id>[^/]*)/?"
+    CATEGORY = "Federation requests"
 
     async def on_GET(
         self,
@@ -157,6 +204,7 @@ class FederationStateIdsServlet(BaseFederationServerServlet):
 
 class FederationBackfillServlet(BaseFederationServerServlet):
     PATH = "/backfill/(?P<room_id>[^/]*)/?"
+    CATEGORY = "Federation requests"
 
     async def on_GET(
         self,
@@ -174,8 +222,50 @@ class FederationBackfillServlet(BaseFederationServerServlet):
         return await self.handler.on_backfill_request(origin, room_id, versions, limit)
 
 
+class FederationTimestampLookupServlet(BaseFederationServerServlet):
+    """
+    API endpoint to fetch the `event_id` of the closest event to the given
+    timestamp (`ts` query parameter) in the given direction (`dir` query
+    parameter).
+
+    Useful for other homeservers when they're unable to find an event locally.
+
+    `ts` is a timestamp in milliseconds where we will find the closest event in
+    the given direction.
+
+    `dir` can be `f` or `b` to indicate forwards and backwards in time from the
+    given timestamp.
+
+    GET /_matrix/federation/v1/timestamp_to_event/<roomID>?ts=<timestamp>&dir=<direction>
+    {
+        "event_id": ...
+    }
+    """
+
+    PATH = "/timestamp_to_event/(?P<room_id>[^/]*)/?"
+    CATEGORY = "Federation requests"
+
+    async def on_GET(
+        self,
+        origin: str,
+        content: Literal[None],
+        query: Dict[bytes, List[bytes]],
+        room_id: str,
+    ) -> Tuple[int, JsonDict]:
+        timestamp = parse_integer_from_args(query, "ts", required=True)
+        direction_str = parse_string_from_args(
+            query, "dir", allowed_values=["f", "b"], required=True
+        )
+        direction = Direction(direction_str)
+
+        return await self.handler.on_timestamp_to_event_request(
+            origin, room_id, timestamp, direction
+        )
+
+
 class FederationQueryServlet(BaseFederationServerServlet):
     PATH = "/query/(?P<query_type>[^/]*)"
+    CATEGORY = "Federation requests"
 
     # This is when we receive a server-server Query
     async def on_GET(
@@ -192,6 +282,7 @@ class FederationQueryServlet(BaseFederationServerServlet):
 
 class FederationMakeJoinServlet(BaseFederationServerServlet):
     PATH = "/make_join/(?P<room_id>[^/]*)/(?P<user_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_GET(
         self,
@@ -227,6 +318,7 @@ class FederationMakeJoinServlet(BaseFederationServerServlet):
 
 class FederationMakeLeaveServlet(BaseFederationServerServlet):
     PATH = "/make_leave/(?P<room_id>[^/]*)/(?P<user_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_GET(
         self,
@@ -242,6 +334,7 @@ class FederationMakeLeaveServlet(BaseFederationServerServlet):
 
 class FederationV1SendLeaveServlet(BaseFederationServerServlet):
     PATH = "/send_leave/(?P<room_id>[^/]*)/(?P<event_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_PUT(
         self,
@@ -257,6 +350,7 @@ class FederationV1SendLeaveServlet(BaseFederationServerServlet):
 
 class FederationV2SendLeaveServlet(BaseFederationServerServlet):
     PATH = "/send_leave/(?P<room_id>[^/]*)/(?P<event_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     PREFIX = FEDERATION_V2_PREFIX
 
@@ -274,6 +368,7 @@ class FederationV2SendLeaveServlet(BaseFederationServerServlet):
 
 class FederationMakeKnockServlet(BaseFederationServerServlet):
     PATH = "/make_knock/(?P<room_id>[^/]*)/(?P<user_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_GET(
         self,
@@ -296,6 +391,7 @@ class FederationMakeKnockServlet(BaseFederationServerServlet):
 
 class FederationV1SendKnockServlet(BaseFederationServerServlet):
     PATH = "/send_knock/(?P<room_id>[^/]*)/(?P<event_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_PUT(
         self,
@@ -311,6 +407,7 @@ class FederationV1SendKnockServlet(BaseFederationServerServlet):
 
 class FederationEventAuthServlet(BaseFederationServerServlet):
     PATH = "/event_auth/(?P<room_id>[^/]*)/(?P<event_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_GET(
         self,
@@ -325,6 +422,7 @@ class FederationEventAuthServlet(BaseFederationServerServlet):
 
 class FederationV1SendJoinServlet(BaseFederationServerServlet):
     PATH = "/send_join/(?P<room_id>[^/]*)/(?P<event_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_PUT(
         self,
@@ -342,6 +440,7 @@ class FederationV1SendJoinServlet(BaseFederationServerServlet):
 
 class FederationV2SendJoinServlet(BaseFederationServerServlet):
     PATH = "/send_join/(?P<room_id>[^/]*)/(?P<event_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     PREFIX = FEDERATION_V2_PREFIX
 
@@ -355,12 +454,18 @@ class FederationV2SendJoinServlet(BaseFederationServerServlet):
     ) -> Tuple[int, JsonDict]:
         # TODO(paul): assert that event_id parsed from path actually
         #   match those given in content
-        result = await self.handler.on_send_join_request(origin, content, room_id)
+
+        partial_state = parse_boolean_from_args(query, "omit_members", default=False)
+
+        result = await self.handler.on_send_join_request(
+            origin, content, room_id, caller_supports_partial_state=partial_state
+        )
         return 200, result
 
 
 class FederationV1InviteServlet(BaseFederationServerServlet):
     PATH = "/invite/(?P<room_id>[^/]*)/(?P<event_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_PUT(
         self,
@@ -385,6 +490,7 @@ class FederationV1InviteServlet(BaseFederationServerServlet):
 
 class FederationV2InviteServlet(BaseFederationServerServlet):
     PATH = "/invite/(?P<room_id>[^/]*)/(?P<event_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     PREFIX = FEDERATION_V2_PREFIX
 
@@ -401,7 +507,7 @@ class FederationV2InviteServlet(BaseFederationServerServlet):
 
         room_version = content["room_version"]
         event = content["event"]
-        invite_room_state = content["invite_room_state"]
+        invite_room_state = content.get("invite_room_state", [])
 
         # Synapse expects invite_room_state to be in unsigned, as it is in v1
         # API
@@ -411,11 +517,17 @@ class FederationV2InviteServlet(BaseFederationServerServlet):
         result = await self.handler.on_invite_request(
             origin, event, room_version_id=room_version
         )
+
+        # We only store invite_room_state for internal use, so remove it before
+        # returning the event to the remote homeserver.
+        result["event"].get("unsigned", {}).pop("invite_room_state", None)
+
         return 200, result
 
 
 class FederationThirdPartyInviteExchangeServlet(BaseFederationServerServlet):
     PATH = "/exchange_third_party_invite/(?P<room_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_PUT(
         self,
@@ -430,6 +542,7 @@ class FederationThirdPartyInviteExchangeServlet(BaseFederationServerServlet):
 
 class FederationClientKeysQueryServlet(BaseFederationServerServlet):
     PATH = "/user/keys/query"
+    CATEGORY = "Federation requests"
 
     async def on_POST(
         self, origin: str, content: JsonDict, query: Dict[bytes, List[bytes]]
@@ -439,6 +552,7 @@ class FederationClientKeysQueryServlet(BaseFederationServerServlet):
 
 class FederationUserDevicesQueryServlet(BaseFederationServerServlet):
     PATH = "/user/devices/(?P<user_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_GET(
         self,
@@ -452,17 +566,54 @@ class FederationUserDevicesQueryServlet(BaseFederationServerServlet):
 
 class FederationClientKeysClaimServlet(BaseFederationServerServlet):
     PATH = "/user/keys/claim"
+    CATEGORY = "Federation requests"
 
     async def on_POST(
         self, origin: str, content: JsonDict, query: Dict[bytes, List[bytes]]
     ) -> Tuple[int, JsonDict]:
-        response = await self.handler.on_claim_client_keys(origin, content)
+        # Generate a count for each algorithm, which is hard-coded to 1.
+        key_query: List[Tuple[str, str, str, int]] = []
+        for user_id, device_keys in content.get("one_time_keys", {}).items():
+            for device_id, algorithm in device_keys.items():
+                key_query.append((user_id, device_id, algorithm, 1))
+
+        response = await self.handler.on_claim_client_keys(
+            key_query, always_include_fallback_keys=False
+        )
+        return 200, response
+
+
+class FederationUnstableClientKeysClaimServlet(BaseFederationServerServlet):
+    """
+    Identical to the stable endpoint (FederationClientKeysClaimServlet) except
+    it allows for querying for multiple OTKs at once and always includes fallback
+    keys in the response.
+    """
+
+    PREFIX = FEDERATION_UNSTABLE_PREFIX
+    PATH = "/user/keys/claim"
+    CATEGORY = "Federation requests"
+
+    async def on_POST(
+        self, origin: str, content: JsonDict, query: Dict[bytes, List[bytes]]
+    ) -> Tuple[int, JsonDict]:
+        # Generate a count for each algorithm.
+        key_query: List[Tuple[str, str, str, int]] = []
+        for user_id, device_keys in content.get("one_time_keys", {}).items():
+            for device_id, algorithms in device_keys.items():
+                counts = Counter(algorithms)
+                for algorithm, count in counts.items():
+                    key_query.append((user_id, device_id, algorithm, count))
+
+        response = await self.handler.on_claim_client_keys(
+            key_query, always_include_fallback_keys=True
+        )
         return 200, response
 
 
 class FederationGetMissingEventsServlet(BaseFederationServerServlet):
-    # TODO(paul): Why does this path alone end with "/?" optional?
-    PATH = "/get_missing_events/(?P<room_id>[^/]*)/?"
+    PATH = "/get_missing_events/(?P<room_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     async def on_POST(
         self,
@@ -488,6 +639,7 @@ class FederationGetMissingEventsServlet(BaseFederationServerServlet):
 
 class On3pidBindServlet(BaseFederationServerServlet):
     PATH = "/3pid/onbind"
+    CATEGORY = "Federation requests"
 
     REQUIRE_AUTH = False
 
@@ -520,6 +672,7 @@ class On3pidBindServlet(BaseFederationServerServlet):
 
 class FederationVersionServlet(BaseFederationServlet):
     PATH = "/version"
+    CATEGORY = "Federation requests"
 
     REQUIRE_AUTH = False
 
@@ -531,92 +684,22 @@ class FederationVersionServlet(BaseFederationServlet):
     ) -> Tuple[int, JsonDict]:
         return (
             200,
-            {"server": {"name": "Synapse", "version": get_version_string(synapse)}},
-        )
-
-
-class FederationSpaceSummaryServlet(BaseFederationServlet):
-    PREFIX = FEDERATION_UNSTABLE_PREFIX + "/org.matrix.msc2946"
-    PATH = "/spaces/(?P<room_id>[^/]*)"
-
-    def __init__(
-        self,
-        hs: HomeServer,
-        authenticator: Authenticator,
-        ratelimiter: FederationRateLimiter,
-        server_name: str,
-    ):
-        super().__init__(hs, authenticator, ratelimiter, server_name)
-        self.handler = hs.get_room_summary_handler()
-
-    async def on_GET(
-        self,
-        origin: str,
-        content: Literal[None],
-        query: Mapping[bytes, Sequence[bytes]],
-        room_id: str,
-    ) -> Tuple[int, JsonDict]:
-        suggested_only = parse_boolean_from_args(query, "suggested_only", default=False)
-
-        max_rooms_per_space = parse_integer_from_args(query, "max_rooms_per_space")
-        if max_rooms_per_space is not None and max_rooms_per_space < 0:
-            raise SynapseError(
-                400,
-                "Value for 'max_rooms_per_space' must be a non-negative integer",
-                Codes.BAD_JSON,
-            )
-
-        exclude_rooms = parse_strings_from_args(query, "exclude_rooms", default=[])
-
-        return 200, await self.handler.federation_space_summary(
-            origin, room_id, suggested_only, max_rooms_per_space, exclude_rooms
-        )
-
-    # TODO When switching to the stable endpoint, remove the POST handler.
-    async def on_POST(
-        self,
-        origin: str,
-        content: JsonDict,
-        query: Mapping[bytes, Sequence[bytes]],
-        room_id: str,
-    ) -> Tuple[int, JsonDict]:
-        suggested_only = content.get("suggested_only", False)
-        if not isinstance(suggested_only, bool):
-            raise SynapseError(
-                400, "'suggested_only' must be a boolean", Codes.BAD_JSON
-            )
-
-        exclude_rooms = content.get("exclude_rooms", [])
-        if not isinstance(exclude_rooms, list) or any(
-            not isinstance(x, str) for x in exclude_rooms
-        ):
-            raise SynapseError(400, "bad value for 'exclude_rooms'", Codes.BAD_JSON)
-
-        max_rooms_per_space = content.get("max_rooms_per_space")
-        if max_rooms_per_space is not None:
-            if not isinstance(max_rooms_per_space, int):
-                raise SynapseError(
-                    400, "bad value for 'max_rooms_per_space'", Codes.BAD_JSON
-                )
-            if max_rooms_per_space < 0:
-                raise SynapseError(
-                    400,
-                    "Value for 'max_rooms_per_space' must be a non-negative integer",
-                    Codes.BAD_JSON,
-                )
-
-        return 200, await self.handler.federation_space_summary(
-            origin, room_id, suggested_only, max_rooms_per_space, exclude_rooms
+            {
+                "server": {
+                    "name": "Synapse",
+                    "version": SYNAPSE_VERSION,
+                }
+            },
         )
 
 
 class FederationRoomHierarchyServlet(BaseFederationServlet):
-    PREFIX = FEDERATION_UNSTABLE_PREFIX + "/org.matrix.msc2946"
     PATH = "/hierarchy/(?P<room_id>[^/]*)"
+    CATEGORY = "Federation requests"
 
     def __init__(
         self,
-        hs: HomeServer,
+        hs: "HomeServer",
         authenticator: Authenticator,
         ratelimiter: FederationRateLimiter,
         server_name: str,
@@ -645,16 +728,17 @@ class RoomComplexityServlet(BaseFederationServlet):
 
     PATH = "/rooms/(?P<room_id>[^/]*)/complexity"
     PREFIX = FEDERATION_UNSTABLE_PREFIX
+    CATEGORY = "Federation requests (unstable)"
 
     def __init__(
         self,
-        hs: HomeServer,
+        hs: "HomeServer",
         authenticator: Authenticator,
         ratelimiter: FederationRateLimiter,
         server_name: str,
     ):
         super().__init__(hs, authenticator, ratelimiter, server_name)
-        self._store = self.hs.get_datastore()
+        self._store = self.hs.get_datastores().main
 
     async def on_GET(
         self,
@@ -674,12 +758,136 @@ class RoomComplexityServlet(BaseFederationServlet):
         return 200, complexity
 
 
+class FederationAccountStatusServlet(BaseFederationServerServlet):
+    PATH = "/query/account_status"
+    PREFIX = FEDERATION_UNSTABLE_PREFIX + "/org.matrix.msc3720"
+
+    def __init__(
+        self,
+        hs: "HomeServer",
+        authenticator: Authenticator,
+        ratelimiter: FederationRateLimiter,
+        server_name: str,
+    ):
+        super().__init__(hs, authenticator, ratelimiter, server_name)
+        self._account_handler = hs.get_account_handler()
+
+    async def on_POST(
+        self,
+        origin: str,
+        content: JsonDict,
+        query: Mapping[bytes, Sequence[bytes]],
+        room_id: str,
+    ) -> Tuple[int, JsonDict]:
+        if "user_ids" not in content:
+            raise SynapseError(
+                400, "Required parameter 'user_ids' is missing", Codes.MISSING_PARAM
+            )
+
+        statuses, failures = await self._account_handler.get_account_statuses(
+            content["user_ids"],
+            allow_remote=False,
+        )
+
+        return 200, {"account_statuses": statuses, "failures": failures}
+
+
+class FederationMediaDownloadServlet(BaseFederationServerServlet):
+    """
+    Implementation of new federation media `/download` endpoint outlined in MSC3916. Returns
+    a multipart/mixed response consisting of a JSON object and the requested media
+    item. This endpoint only returns local media.
+    """
+
+    PATH = "/media/download/(?P<media_id>[^/]*)"
+    RATELIMIT = True
+
+    def __init__(
+        self,
+        hs: "HomeServer",
+        ratelimiter: FederationRateLimiter,
+        authenticator: Authenticator,
+        server_name: str,
+    ):
+        super().__init__(hs, authenticator, ratelimiter, server_name)
+        self.media_repo = self.hs.get_media_repository()
+
+    async def on_GET(
+        self,
+        origin: Optional[str],
+        content: Literal[None],
+        request: SynapseRequest,
+        media_id: str,
+    ) -> None:
+        max_timeout_ms = parse_integer(
+            request, "timeout_ms", default=DEFAULT_MAX_TIMEOUT_MS
+        )
+        max_timeout_ms = min(max_timeout_ms, MAXIMUM_ALLOWED_MAX_TIMEOUT_MS)
+        await self.media_repo.get_local_media(
+            request, media_id, None, max_timeout_ms, federation=True
+        )
+
+
+class FederationMediaThumbnailServlet(BaseFederationServerServlet):
+    """
+    Implementation of new federation media `/thumbnail` endpoint outlined in MSC3916. Returns
+    a multipart/mixed response consisting of a JSON object and the requested media
+    item. This endpoint only returns local media.
+    """
+
+    PATH = "/media/thumbnail/(?P<media_id>[^/]*)"
+    RATELIMIT = True
+
+    def __init__(
+        self,
+        hs: "HomeServer",
+        ratelimiter: FederationRateLimiter,
+        authenticator: Authenticator,
+        server_name: str,
+    ):
+        super().__init__(hs, authenticator, ratelimiter, server_name)
+        self.media_repo = self.hs.get_media_repository()
+        self.dynamic_thumbnails = hs.config.media.dynamic_thumbnails
+        self.thumbnail_provider = ThumbnailProvider(
+            hs, self.media_repo, self.media_repo.media_storage
+        )
+
+    async def on_GET(
+        self,
+        origin: Optional[str],
+        content: Literal[None],
+        request: SynapseRequest,
+        media_id: str,
+    ) -> None:
+
+        width = parse_integer(request, "width", required=True)
+        height = parse_integer(request, "height", required=True)
+        method = parse_string(request, "method", "scale")
+        # TODO Parse the Accept header to get an prioritised list of thumbnail types.
+        m_type = "image/png"
+        max_timeout_ms = parse_integer(
+            request, "timeout_ms", default=DEFAULT_MAX_TIMEOUT_MS
+        )
+        max_timeout_ms = min(max_timeout_ms, MAXIMUM_ALLOWED_MAX_TIMEOUT_MS)
+
+        if self.dynamic_thumbnails:
+            await self.thumbnail_provider.select_or_generate_local_thumbnail(
+                request, media_id, width, height, method, m_type, max_timeout_ms, True
+            )
+        else:
+            await self.thumbnail_provider.respond_local_thumbnail(
+                request, media_id, width, height, method, m_type, max_timeout_ms, True
+            )
+        self.media_repo.mark_recently_accessed(None, media_id)
+
+
 FEDERATION_SERVLET_CLASSES: Tuple[Type[BaseFederationServlet], ...] = (
     FederationSendServlet,
     FederationEventServlet,
     FederationStateV1Servlet,
     FederationStateIdsServlet,
     FederationBackfillServlet,
+    FederationTimestampLookupServlet,
     FederationQueryServlet,
     FederationMakeJoinServlet,
     FederationMakeLeaveServlet,
@@ -695,12 +903,13 @@ FEDERATION_SERVLET_CLASSES: Tuple[Type[BaseFederationServlet], ...] = (
     FederationClientKeysQueryServlet,
     FederationUserDevicesQueryServlet,
     FederationClientKeysClaimServlet,
+    FederationUnstableClientKeysClaimServlet,
     FederationThirdPartyInviteExchangeServlet,
     On3pidBindServlet,
     FederationVersionServlet,
     RoomComplexityServlet,
-    FederationSpaceSummaryServlet,
     FederationRoomHierarchyServlet,
     FederationV1SendKnockServlet,
     FederationMakeKnockServlet,
+    FederationAccountStatusServlet,
 )

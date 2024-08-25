@@ -1,63 +1,137 @@
-# Copyright 2014-2016 OpenMarket Ltd
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2020 The Matrix.org Foundation C.I.C.
+# Copyright 2014-2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import collections.abc
 import logging
-from collections import namedtuple
-from typing import TYPE_CHECKING, Iterable, Optional, Set
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Collection,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+    cast,
+    overload,
+)
 
-from synapse.api.constants import EventTypes, Membership
+import attr
+
+from synapse.api.constants import EventContentFields, EventTypes, Membership
 from synapse.api.errors import NotFoundError, UnsupportedRoomVersionError
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersion
 from synapse.events import EventBase
+from synapse.events.snapshot import EventContext
+from synapse.logging.opentracing import trace
+from synapse.replication.tcp.streams import UnPartialStatedEventStream
+from synapse.replication.tcp.streams.partial_state import UnPartialStatedEventStreamRow
 from synapse.storage._base import SQLBaseStore
-from synapse.storage.database import DatabasePool, LoggingTransaction
+from synapse.storage.database import (
+    DatabasePool,
+    LoggingDatabaseConnection,
+    LoggingTransaction,
+    make_in_list_sql_clause,
+)
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.roommember import RoomMemberWorkerStore
-from synapse.storage.state import StateFilter
-from synapse.types import StateMap
+from synapse.types import JsonDict, JsonMapping, StateKey, StateMap, StrCollection
+from synapse.types.state import StateFilter
 from synapse.util.caches import intern_string
 from synapse.util.caches.descriptors import cached, cachedList
+from synapse.util.cancellation import cancellable
+from synapse.util.iterutils import batch_iter
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
 
 MAX_STATE_DELTA_HOPS = 100
 
 
-class _GetStateGroupDelta(
-    namedtuple("_GetStateGroupDelta", ("prev_group", "delta_ids"))
-):
-    """Return type of get_state_group_delta that implements __len__, which lets
-    us use the itrable flag when caching
-    """
+# Freeze so it's immutable and we can use it as a cache value
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class Sentinel:
+    pass
 
-    __slots__ = []
 
-    def __len__(self):
-        return len(self.delta_ids) if self.delta_ids else 0
+ROOM_UNKNOWN_SENTINEL = Sentinel()
+
+
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class EventMetadata:
+    """Returned by `get_metadata_for_events`"""
+
+    room_id: str
+    event_type: str
+    state_key: Optional[str]
+    rejection_reason: Optional[str]
+
+
+def _retrieve_and_check_room_version(room_id: str, room_version_id: str) -> RoomVersion:
+    v = KNOWN_ROOM_VERSIONS.get(room_version_id)
+    if not v:
+        raise UnsupportedRoomVersionError(
+            "Room %s uses a room version %s which is no longer supported"
+            % (room_id, room_version_id)
+        )
+    return v
 
 
 # this inherits from EventsWorkerStore because it calls self.get_events
 class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
     """The parts of StateGroupStore that can be called from workers."""
 
-    def __init__(self, database: DatabasePool, db_conn, hs: "HomeServer"):
+    def __init__(
+        self,
+        database: DatabasePool,
+        db_conn: LoggingDatabaseConnection,
+        hs: "HomeServer",
+    ):
         super().__init__(database, db_conn, hs)
+        self._instance_name: str = hs.get_instance_name()
+
+    def process_replication_rows(
+        self,
+        stream_name: str,
+        instance_name: str,
+        token: int,
+        rows: Iterable[Any],
+    ) -> None:
+        if stream_name == UnPartialStatedEventStream.NAME:
+            for row in rows:
+                assert isinstance(row, UnPartialStatedEventStreamRow)
+                self._get_state_group_for_event.invalidate((row.event_id,))
+                self.is_partial_state_event.invalidate((row.event_id,))
+
+        super().process_replication_rows(stream_name, instance_name, token, rows)
 
     async def get_room_version(self, room_id: str) -> RoomVersion:
         """Get the room_version of a given room
@@ -67,11 +141,8 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 Typically this happens if support for the room's version has been
                 removed from Synapse.
         """
-        return await self.db_pool.runInteraction(
-            "get_room_version_txn",
-            self.get_room_version_txn,
-            room_id,
-        )
+        room_version_id = await self.get_room_version_id(room_id)
+        return _retrieve_and_check_room_version(room_id, room_version_id)
 
     def get_room_version_txn(
         self, txn: LoggingTransaction, room_id: str
@@ -87,15 +158,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
                 removed from Synapse.
         """
         room_version_id = self.get_room_version_id_txn(txn, room_id)
-        v = KNOWN_ROOM_VERSIONS.get(room_version_id)
-
-        if not v:
-            raise UnsupportedRoomVersionError(
-                "Room %s uses a room version %s which is no longer supported"
-                % (room_id, room_version_id)
-            )
-
-        return v
+        return _retrieve_and_check_room_version(room_id, room_version_id)
 
     @cached(max_entries=10000)
     async def get_room_version_id(self, room_id: str) -> str:
@@ -118,13 +181,8 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             NotFoundError: if the room is unknown
         """
 
-        # First we try looking up room version from the database, but for old
-        # rooms we might not have added the room version to it yet so we fall
-        # back to previous behaviour and look in current state events.
-        #
         # We really should have an entry in the rooms table for every room we
-        # care about, but let's be a bit paranoid (at least while the background
-        # update is happening) to avoid breaking existing rooms.
+        # care about, but let's be a bit paranoid.
         room_version = self.db_pool.simple_select_one_onecol_txn(
             txn,
             table="rooms",
@@ -134,11 +192,63 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         )
 
         if room_version is None:
-            raise NotFoundError("Could not room_version for %s" % (room_id,))
+            raise NotFoundError("Could not find room_version for %s" % (room_id,))
 
         return room_version
 
-    async def get_room_predecessor(self, room_id: str) -> Optional[dict]:
+    @trace
+    async def get_metadata_for_events(
+        self, event_ids: Collection[str]
+    ) -> Dict[str, EventMetadata]:
+        """Get some metadata (room_id, type, state_key) for the given events.
+
+        This method is a faster alternative than fetching the full events from
+        the DB, and should be used when the full event is not needed.
+
+        Returns metadata for rejected and redacted events. Events that have not
+        been persisted are omitted from the returned dict.
+        """
+
+        def get_metadata_for_events_txn(
+            txn: LoggingTransaction,
+            batch_ids: Collection[str],
+        ) -> Dict[str, EventMetadata]:
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "e.event_id", batch_ids
+            )
+
+            sql = f"""
+                SELECT e.event_id, e.room_id, e.type, se.state_key, r.reason
+                FROM events AS e
+                LEFT JOIN state_events se USING (event_id)
+                LEFT JOIN rejections r USING (event_id)
+                WHERE {clause}
+            """
+
+            txn.execute(sql, args)
+            return {
+                event_id: EventMetadata(
+                    room_id=room_id,
+                    event_type=event_type,
+                    state_key=state_key,
+                    rejection_reason=rejection_reason,
+                )
+                for event_id, room_id, event_type, state_key, rejection_reason in txn
+            }
+
+        result_map: Dict[str, EventMetadata] = {}
+        for batch_ids in batch_iter(event_ids, 1000):
+            result_map.update(
+                await self.db_pool.runInteraction(
+                    "get_metadata_for_events",
+                    get_metadata_for_events_txn,
+                    batch_ids=batch_ids,
+                )
+            )
+
+        return result_map
+
+    async def get_room_predecessor(self, room_id: str) -> Optional[JsonMapping]:
         """Get the predecessor of an upgraded room if it exists.
         Otherwise return None.
 
@@ -167,6 +277,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         if not isinstance(predecessor, collections.abc.Mapping):
             return None
 
+        # The keys must be strings since the data is JSON.
         return predecessor
 
     async def get_create_event_for_room(self, room_id: str) -> EventBase:
@@ -181,21 +292,215 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         Raises:
             NotFoundError if the room is unknown
         """
-        state_ids = await self.get_current_state_ids(room_id)
+        state_ids = await self.get_partial_current_state_ids(room_id)
+
+        if not state_ids:
+            raise NotFoundError(f"Current state for room {room_id} is empty")
+
         create_id = state_ids.get((EventTypes.Create, ""))
 
         # If we can't find the create event, assume we've hit a dead end
         if not create_id:
-            raise NotFoundError("Unknown room %s" % (room_id,))
+            raise NotFoundError(f"No create event in current state for room {room_id}")
 
         # Retrieve the room's create event and return
         create_event = await self.get_event(create_id)
         return create_event
 
+    @cached(max_entries=10000)
+    async def get_room_type(self, room_id: str) -> Optional[str]:
+        raise NotImplementedError()
+
+    @cachedList(cached_method_name="get_room_type", list_name="room_ids")
+    async def bulk_get_room_type(
+        self, room_ids: Set[str]
+    ) -> Mapping[str, Union[Optional[str], Sentinel]]:
+        """
+        Bulk fetch room types for the given rooms (via current state).
+
+        Since this function is cached, any missing values would be cached as `None`. In
+        order to distinguish between an unencrypted room that has `None` encryption and
+        a room that is unknown to the server where we might want to omit the value
+        (which would make it cached as `None`), instead we use the sentinel value
+        `ROOM_UNKNOWN_SENTINEL`.
+
+        Returns:
+            A mapping from room ID to the room's type (`None` is a valid room type).
+            Rooms unknown to this server will return `ROOM_UNKNOWN_SENTINEL`.
+        """
+
+        def txn(
+            txn: LoggingTransaction,
+        ) -> MutableMapping[str, Union[Optional[str], Sentinel]]:
+            clause, args = make_in_list_sql_clause(
+                txn.database_engine, "room_id", room_ids
+            )
+
+            # We can't rely on `room_stats_state.room_type` if the server has left the
+            # room because the `room_id` will still be in the table but everything will
+            # be set to `None` but `None` is a valid room type value. We join against
+            # the `room_stats_current` table which keeps track of the
+            # `current_state_events` count (and a proxy value `local_users_in_room`
+            # which can used to assume the server is participating in the room and has
+            # current state) to ensure that the data in `room_stats_state` is up-to-date
+            # with the current state.
+            #
+            # FIXME: Use `room_stats_current.current_state_events` instead of
+            # `room_stats_current.local_users_in_room` once
+            # https://github.com/element-hq/synapse/issues/17457 is fixed.
+            sql = f"""
+                SELECT room_id, room_type
+                FROM room_stats_state
+                INNER JOIN room_stats_current USING (room_id)
+                WHERE
+                    {clause}
+                    AND local_users_in_room > 0
+            """
+
+            txn.execute(sql, args)
+
+            room_id_to_type_map = {}
+            for row in txn:
+                room_id_to_type_map[row[0]] = row[1]
+
+            return room_id_to_type_map
+
+        results = await self.db_pool.runInteraction(
+            "bulk_get_room_type",
+            txn,
+        )
+
+        # If we haven't updated `room_stats_state` with the room yet, query the
+        # create events directly. This should happen only rarely so we don't
+        # mind if we do this in a loop.
+        for room_id in room_ids - results.keys():
+            try:
+                create_event = await self.get_create_event_for_room(room_id)
+                room_type = create_event.content.get(EventContentFields.ROOM_TYPE)
+                results[room_id] = room_type
+            except NotFoundError:
+                # We use the sentinel value to distinguish between `None` which is a
+                # valid room type and a room that is unknown to the server so the value
+                # is just unset.
+                results[room_id] = ROOM_UNKNOWN_SENTINEL
+
+        return results
+
+    @cached(max_entries=10000)
+    async def get_room_encryption(self, room_id: str) -> Optional[str]:
+        raise NotImplementedError()
+
+    @cachedList(cached_method_name="get_room_encryption", list_name="room_ids")
+    async def bulk_get_room_encryption(
+        self, room_ids: Set[str]
+    ) -> Mapping[str, Union[Optional[str], Sentinel]]:
+        """
+        Bulk fetch room encryption for the given rooms (via current state).
+
+        Since this function is cached, any missing values would be cached as `None`. In
+        order to distinguish between an unencrypted room that has `None` encryption and
+        a room that is unknown to the server where we might want to omit the value
+        (which would make it cached as `None`), instead we use the sentinel value
+        `ROOM_UNKNOWN_SENTINEL`.
+
+        Returns:
+            A mapping from room ID to the room's encryption algorithm if the room is
+            encrypted, otherwise `None`. Rooms unknown to this server will return
+            `ROOM_UNKNOWN_SENTINEL`.
+        """
+
+        def txn(
+            txn: LoggingTransaction,
+        ) -> MutableMapping[str, Union[Optional[str], Sentinel]]:
+            clause, args = make_in_list_sql_clause(
+                txn.database_engine, "room_id", room_ids
+            )
+
+            # We can't rely on `room_stats_state.encryption` if the server has left the
+            # room because the `room_id` will still be in the table but everything will
+            # be set to `None` but `None` is a valid encryption value. We join against
+            # the `room_stats_current` table which keeps track of the
+            # `current_state_events` count (and a proxy value `local_users_in_room`
+            # which can used to assume the server is participating in the room and has
+            # current state) to ensure that the data in `room_stats_state` is up-to-date
+            # with the current state.
+            #
+            # FIXME: Use `room_stats_current.current_state_events` instead of
+            # `room_stats_current.local_users_in_room` once
+            # https://github.com/element-hq/synapse/issues/17457 is fixed.
+            sql = f"""
+                SELECT room_id, encryption
+                FROM room_stats_state
+                INNER JOIN room_stats_current USING (room_id)
+                WHERE
+                    {clause}
+                    AND local_users_in_room > 0
+            """
+
+            txn.execute(sql, args)
+
+            room_id_to_encryption_map = {}
+            for row in txn:
+                room_id_to_encryption_map[row[0]] = row[1]
+
+            return room_id_to_encryption_map
+
+        results = await self.db_pool.runInteraction(
+            "bulk_get_room_encryption",
+            txn,
+        )
+
+        # If we haven't updated `room_stats_state` with the room yet, query the state
+        # directly. This should happen only rarely so we don't mind if we do this in a
+        # loop.
+        encryption_event_ids: List[str] = []
+        for room_id in room_ids - results.keys():
+            state_map = await self.get_partial_filtered_current_state_ids(
+                room_id,
+                state_filter=StateFilter.from_types(
+                    [
+                        (EventTypes.Create, ""),
+                        (EventTypes.RoomEncryption, ""),
+                    ]
+                ),
+            )
+            # We can use the create event as a canary to tell whether the server has
+            # seen the room before
+            create_event_id = state_map.get((EventTypes.Create, ""))
+            encryption_event_id = state_map.get((EventTypes.RoomEncryption, ""))
+
+            if create_event_id is None:
+                # We use the sentinel value to distinguish between `None` which is a
+                # valid room type and a room that is unknown to the server so the value
+                # is just unset.
+                results[room_id] = ROOM_UNKNOWN_SENTINEL
+                continue
+
+            if encryption_event_id is None:
+                results[room_id] = None
+            else:
+                encryption_event_ids.append(encryption_event_id)
+
+        encryption_event_map = await self.get_events(encryption_event_ids)
+
+        for encryption_event_id in encryption_event_ids:
+            encryption_event = encryption_event_map.get(encryption_event_id)
+            # If the curent state says there is an encryption event, we should have it
+            # in the database.
+            assert encryption_event is not None
+
+            results[encryption_event.room_id] = encryption_event.content.get(
+                EventContentFields.ENCRYPTION_ALGORITHM
+            )
+
+        return results
+
     @cached(max_entries=100000, iterable=True)
-    async def get_current_state_ids(self, room_id: str) -> StateMap[str]:
+    async def get_partial_current_state_ids(self, room_id: str) -> StateMap[str]:
         """Get the current state event ids for a room based on the
         current_state_events table.
+
+        This may be the partial state if we're lazy joining the room.
 
         Args:
             room_id: The room to get the state IDs of.
@@ -204,7 +509,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             The current state of the room.
         """
 
-        def _get_current_state_ids_txn(txn):
+        def _get_current_state_ids_txn(txn: LoggingTransaction) -> StateMap[str]:
             txn.execute(
                 """SELECT type, state_key, event_id FROM current_state_events
                 WHERE room_id = ?
@@ -215,16 +520,33 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             return {(intern_string(r[0]), intern_string(r[1])): r[2] for r in txn}
 
         return await self.db_pool.runInteraction(
-            "get_current_state_ids", _get_current_state_ids_txn
+            "get_partial_current_state_ids", _get_current_state_ids_txn
         )
 
+    async def check_if_events_in_current_state(
+        self, event_ids: StrCollection
+    ) -> FrozenSet[str]:
+        """Checks and returns which of the given events is part of the current state."""
+        rows = await self.db_pool.simple_select_many_batch(
+            table="current_state_events",
+            column="event_id",
+            iterable=event_ids,
+            retcols=("event_id",),
+            desc="check_if_events_in_current_state",
+        )
+
+        return frozenset(event_id for event_id, in rows)
+
     # FIXME: how should this be cached?
-    async def get_filtered_current_state_ids(
+    @cancellable
+    async def get_partial_filtered_current_state_ids(
         self, room_id: str, state_filter: Optional[StateFilter] = None
     ) -> StateMap[str]:
         """Get the current state event of a given type for a room based on the
         current_state_events table.  This may not be as up-to-date as the result
         of doing a fresh state resolution as per state_handler.get_current_state
+
+        This may be the partial state if we're lazy joining the room.
 
         Args:
             room_id
@@ -241,10 +563,13 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
 
         if not where_clause:
             # We delegate to the cached version
-            return await self.get_current_state_ids(room_id)
+            return await self.get_partial_current_state_ids(room_id)
 
-        def _get_filtered_current_state_ids_txn(txn):
-            results = {}
+        def _get_filtered_current_state_ids_txn(
+            txn: LoggingTransaction,
+        ) -> StateMap[str]:
+            results = StateMapWrapper(state_filter=state_filter or StateFilter.all())
+
             sql = """
                 SELECT type, state_key, event_id FROM current_state_events
                 WHERE room_id = ?
@@ -267,30 +592,6 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             "get_filtered_current_state_ids", _get_filtered_current_state_ids_txn
         )
 
-    async def get_canonical_alias_for_room(self, room_id: str) -> Optional[str]:
-        """Get canonical alias for room, if any
-
-        Args:
-            room_id: The room ID
-
-        Returns:
-            The canonical alias, if any
-        """
-
-        state = await self.get_filtered_current_state_ids(
-            room_id, StateFilter.from_types([(EventTypes.CanonicalAlias, "")])
-        )
-
-        event_id = state.get((EventTypes.CanonicalAlias, ""))
-        if not event_id:
-            return
-
-        event = await self.get_event(event_id, allow_none=True)
-        if not event:
-            return
-
-        return event.content.get("canonical_alias")
-
     @cached(max_entries=50000)
     async def _get_state_group_for_event(self, event_id: str) -> Optional[int]:
         return await self.db_pool.simple_select_one_onecol(
@@ -306,18 +607,31 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
         list_name="event_ids",
         num_args=1,
     )
-    async def _get_state_group_for_events(self, event_ids):
-        """Returns mapping event_id -> state_group"""
-        rows = await self.db_pool.simple_select_many_batch(
-            table="event_to_state_groups",
-            column="event_id",
-            iterable=event_ids,
-            keyvalues={},
-            retcols=("event_id", "state_group"),
-            desc="_get_state_group_for_events",
+    async def _get_state_group_for_events(
+        self, event_ids: Collection[str]
+    ) -> Mapping[str, int]:
+        """Returns mapping event_id -> state_group.
+
+        Raises:
+             RuntimeError if the state is unknown at any of the given events
+        """
+        rows = cast(
+            List[Tuple[str, int]],
+            await self.db_pool.simple_select_many_batch(
+                table="event_to_state_groups",
+                column="event_id",
+                iterable=event_ids,
+                keyvalues={},
+                retcols=("event_id", "state_group"),
+                desc="_get_state_group_for_events",
+            ),
         )
 
-        return {row["event_id"]: row["state_group"] for row in rows}
+        res = dict(rows)
+        for e in event_ids:
+            if e not in res:
+                raise RuntimeError("No state group for unknown or outlier event %s" % e)
+        return res
 
     async def get_referenced_state_groups(
         self, state_groups: Iterable[int]
@@ -331,28 +645,107 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             The subset of state groups that are referenced.
         """
 
-        rows = await self.db_pool.simple_select_many_batch(
-            table="event_to_state_groups",
-            column="state_group",
-            iterable=state_groups,
-            keyvalues={},
-            retcols=("DISTINCT state_group",),
-            desc="get_referenced_state_groups",
+        rows = cast(
+            List[Tuple[int]],
+            await self.db_pool.simple_select_many_batch(
+                table="event_to_state_groups",
+                column="state_group",
+                iterable=state_groups,
+                keyvalues={},
+                retcols=("DISTINCT state_group",),
+                desc="get_referenced_state_groups",
+            ),
         )
 
-        return {row["state_group"] for row in rows}
+        return {row[0] for row in rows}
+
+    async def update_state_for_partial_state_event(
+        self,
+        event: EventBase,
+        context: EventContext,
+    ) -> None:
+        """Update the state group for a partial state event"""
+        async with self._un_partial_stated_events_stream_id_gen.get_next() as un_partial_state_event_stream_id:
+            await self.db_pool.runInteraction(
+                "update_state_for_partial_state_event",
+                self._update_state_for_partial_state_event_txn,
+                event,
+                context,
+                un_partial_state_event_stream_id,
+            )
+
+    def _update_state_for_partial_state_event_txn(
+        self,
+        txn: LoggingTransaction,
+        event: EventBase,
+        context: EventContext,
+        un_partial_state_event_stream_id: int,
+    ) -> None:
+        # we shouldn't have any outliers here
+        assert not event.internal_metadata.is_outlier()
+
+        # anything that was rejected should have the same state as its
+        # predecessor.
+        if context.rejected:
+            state_group = context.state_group_before_event
+        else:
+            state_group = context.state_group
+
+        self.db_pool.simple_update_txn(
+            txn,
+            table="event_to_state_groups",
+            keyvalues={"event_id": event.event_id},
+            updatevalues={"state_group": state_group},
+        )
+
+        # the event may now be rejected where it was not before, or vice versa,
+        # in which case we need to update the rejected flags.
+        rejection_status_changed = bool(context.rejected) != (
+            event.rejected_reason is not None
+        )
+        if rejection_status_changed:
+            self.mark_event_rejected_txn(txn, event.event_id, context.rejected)
+
+        self.db_pool.simple_delete_one_txn(
+            txn,
+            table="partial_state_events",
+            keyvalues={"event_id": event.event_id},
+        )
+
+        txn.call_after(self.is_partial_state_event.invalidate, (event.event_id,))
+        txn.call_after(
+            self._get_state_group_for_event.prefill,
+            (event.event_id,),
+            state_group,
+        )
+
+        self.db_pool.simple_insert_txn(
+            txn,
+            "un_partial_stated_event_stream",
+            {
+                "stream_id": un_partial_state_event_stream_id,
+                "instance_name": self._instance_name,
+                "event_id": event.event_id,
+                "rejection_status_changed": rejection_status_changed,
+            },
+        )
+        txn.call_after(self.hs.get_notifier().on_new_replication_data)
 
 
 class MainStateBackgroundUpdateStore(RoomMemberWorkerStore):
-
     CURRENT_STATE_INDEX_UPDATE_NAME = "current_state_members_idx"
     EVENT_STATE_GROUP_INDEX_UPDATE_NAME = "event_to_state_groups_sg_index"
     DELETE_CURRENT_STATE_UPDATE_NAME = "delete_old_current_state_events"
 
-    def __init__(self, database: DatabasePool, db_conn, hs: "HomeServer"):
+    def __init__(
+        self,
+        database: DatabasePool,
+        db_conn: LoggingDatabaseConnection,
+        hs: "HomeServer",
+    ):
         super().__init__(database, db_conn, hs)
 
-        self.server_name = hs.hostname
+        self.server_name: str = hs.hostname
 
         self.db_pool.updates.register_background_index_update(
             self.CURRENT_STATE_INDEX_UPDATE_NAME,
@@ -372,7 +765,9 @@ class MainStateBackgroundUpdateStore(RoomMemberWorkerStore):
             self._background_remove_left_rooms,
         )
 
-    async def _background_remove_left_rooms(self, progress, batch_size):
+    async def _background_remove_left_rooms(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
         """Background update to delete rows from `current_state_events` and
         `event_forward_extremities` tables of rooms that the server is no
         longer joined to.
@@ -380,7 +775,9 @@ class MainStateBackgroundUpdateStore(RoomMemberWorkerStore):
 
         last_room_id = progress.get("last_room_id", "")
 
-        def _background_remove_left_rooms_txn(txn):
+        def _background_remove_left_rooms_txn(
+            txn: LoggingTransaction,
+        ) -> Tuple[bool, Set[str]]:
             # get a batch of room ids to consider
             sql = """
                 SELECT DISTINCT room_id FROM current_state_events
@@ -460,16 +857,22 @@ class MainStateBackgroundUpdateStore(RoomMemberWorkerStore):
             # potentially stale, since there may have been a period where the
             # server didn't share a room with the remote user and therefore may
             # have missed any device updates.
-            rows = self.db_pool.simple_select_many_txn(
-                txn,
-                table="current_state_events",
-                column="room_id",
-                iterable=to_delete,
-                keyvalues={"type": EventTypes.Member, "membership": Membership.JOIN},
-                retcols=("state_key",),
+            rows = cast(
+                List[Tuple[str]],
+                self.db_pool.simple_select_many_txn(
+                    txn,
+                    table="current_state_events",
+                    column="room_id",
+                    iterable=to_delete,
+                    keyvalues={
+                        "type": EventTypes.Member,
+                        "membership": Membership.JOIN,
+                    },
+                    retcols=("state_key",),
+                ),
             )
 
-            potentially_left_users = {row["state_key"] for row in rows}
+            potentially_left_users = {row[0] for row in rows}
 
             # Now lets actually delete the rooms from the DB.
             self.db_pool.simple_delete_many_txn(
@@ -512,7 +915,7 @@ class MainStateBackgroundUpdateStore(RoomMemberWorkerStore):
         )
 
         for user_id in potentially_left_users - joined_users:
-            await self.mark_remote_user_device_list_as_unsubscribed(user_id)
+            await self.mark_remote_user_device_list_as_unsubscribed(user_id)  # type: ignore[attr-defined]
 
         return batch_size
 
@@ -536,5 +939,46 @@ class StateStore(StateGroupWorkerStore, MainStateBackgroundUpdateStore):
       * `state_groups_state`: Maps state group to state events.
     """
 
-    def __init__(self, database: DatabasePool, db_conn, hs: "HomeServer"):
+    def __init__(
+        self,
+        database: DatabasePool,
+        db_conn: LoggingDatabaseConnection,
+        hs: "HomeServer",
+    ):
         super().__init__(database, db_conn, hs)
+
+
+@attr.s(auto_attribs=True, slots=True)
+class StateMapWrapper(Dict[StateKey, str]):
+    """A wrapper around a StateMap[str] to ensure that we only query for items
+    that were not filtered out.
+
+    This is to help prevent bugs where we filter out state but other bits of the
+    code expect the state to be there.
+    """
+
+    state_filter: StateFilter
+
+    def __getitem__(self, key: StateKey) -> str:
+        if key not in self.state_filter:
+            raise Exception("State map was filtered and doesn't include: %s", key)
+        return super().__getitem__(key)
+
+    @overload
+    def get(self, key: Tuple[str, str]) -> Optional[str]: ...
+
+    @overload
+    def get(self, key: Tuple[str, str], default: Union[str, _T]) -> Union[str, _T]: ...
+
+    def get(
+        self, key: StateKey, default: Union[str, _T, None] = None
+    ) -> Union[str, _T, None]:
+        if key not in self.state_filter:
+            raise Exception("State map was filtered and doesn't include: %s", key)
+        return super().get(key, default)
+
+    def __contains__(self, key: Any) -> bool:
+        if key not in self.state_filter:
+            raise Exception("State map was filtered and doesn't include: %s", key)
+
+        return super().__contains__(key)

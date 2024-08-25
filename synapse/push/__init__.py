@@ -1,16 +1,97 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2015, 2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
+
+"""
+This module implements the push rules & notifications portion of the Matrix
+specification.
+
+There's a few related features:
+
+* Push notifications (i.e. email or outgoing requests to a Push Gateway).
+* Calculation of unread notifications (for /sync and /notifications).
+
+When Synapse receives a new event (locally, via the Client-Server API, or via
+federation), the following occurs:
+
+1. The push rules get evaluated to generate a set of per-user actions.
+2. The event is persisted into the database.
+3. (In the background) The notifier is notified about the new event.
+
+The per-user actions are initially stored in the event_push_actions_staging table,
+before getting moved into the event_push_actions table when the event is persisted.
+The event_push_actions table is periodically summarised into the event_push_summary
+and event_push_summary_stream_ordering tables.
+
+Since push actions block an event from being persisted the generation of push
+actions is performance sensitive.
+
+The general interaction of the classes are:
+
+        +---------------------------------------------+
+        | FederationEventHandler/EventCreationHandler |
+        +---------------------------------------------+
+                |
+                v
+        +-----------------------+     +---------------------------+
+        | BulkPushRuleEvaluator |---->| PushRuleEvaluatorForEvent |
+        +-----------------------+     +---------------------------+
+                |
+                v
+        +-----------------------------+
+        | EventPushActionsWorkerStore |
+        +-----------------------------+
+
+The notifier notifies the pusher pool of the new event, which checks for affected
+users. Each user-configured pusher of the affected users then performs the
+previously calculated action.
+
+The general interaction of the classes are:
+
+        +----------+
+        | Notifier |
+        +----------+
+                |
+                v
+        +------------+     +--------------+
+        | PusherPool |---->| PusherConfig |
+        +------------+     +--------------+
+                |
+                |     +---------------+
+                +<--->| PusherFactory |
+                |     +---------------+
+                v
+        +------------------------+     +-----------------------------------------------+
+        | EmailPusher/HttpPusher |---->| EventPushActionsWorkerStore/PusherWorkerStore |
+        +------------------------+     +-----------------------------------------------+
+                |
+                v
+        +-------------------------+
+        | Mailer/SimpleHttpClient |
+        +-------------------------+
+
+The Pusher instance also calls out to various utilities for generating payloads
+(or email templates), but those interactions are not detailed in this diagram
+(and are specific to the type of pusher).
+
+"""
 
 import abc
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -23,25 +104,32 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 
-@attr.s(slots=True)
+@attr.s(slots=True, auto_attribs=True)
 class PusherConfig:
     """Parameters necessary to configure a pusher."""
 
-    id = attr.ib(type=Optional[str])
-    user_name = attr.ib(type=str)
-    access_token = attr.ib(type=Optional[int])
-    profile_tag = attr.ib(type=str)
-    kind = attr.ib(type=str)
-    app_id = attr.ib(type=str)
-    app_display_name = attr.ib(type=str)
-    device_display_name = attr.ib(type=str)
-    pushkey = attr.ib(type=str)
-    ts = attr.ib(type=int)
-    lang = attr.ib(type=Optional[str])
-    data = attr.ib(type=Optional[JsonDict])
-    last_stream_ordering = attr.ib(type=int)
-    last_success = attr.ib(type=Optional[int])
-    failing_since = attr.ib(type=Optional[int])
+    id: Optional[int]
+    user_name: str
+
+    profile_tag: str
+    kind: str
+    app_id: str
+    app_display_name: str
+    device_display_name: str
+    pushkey: str
+    ts: int
+    lang: Optional[str]
+    data: Optional[JsonDict]
+    last_stream_ordering: int
+    last_success: Optional[int]
+    failing_since: Optional[int]
+    enabled: bool
+    device_id: Optional[str]
+
+    # XXX(quenting): The access_token is not persisted anymore for new pushers, but we
+    # keep it when reading from the database, so that we don't get stale pushers
+    # while the "set_device_id_for_pushers" background update is running.
+    access_token: Optional[int]
 
     def as_dict(self) -> Dict[str, Any]:
         """Information that can be retrieved about a pusher after creation."""
@@ -54,21 +142,23 @@ class PusherConfig:
             "lang": self.lang,
             "profile_tag": self.profile_tag,
             "pushkey": self.pushkey,
+            "enabled": self.enabled,
+            "device_id": self.device_id,
         }
 
 
-@attr.s(slots=True)
+@attr.s(slots=True, auto_attribs=True)
 class ThrottleParams:
     """Parameters for controlling the rate of sending pushes via email."""
 
-    last_sent_ts = attr.ib(type=int)
-    throttle_ms = attr.ib(type=int)
+    last_sent_ts: int
+    throttle_ms: int
 
 
 class Pusher(metaclass=abc.ABCMeta):
     def __init__(self, hs: "HomeServer", pusher_config: PusherConfig):
         self.hs = hs
-        self.store = self.hs.get_datastore()
+        self.store = self.hs.get_datastores().main
         self.clock = self.hs.get_clock()
 
         self.pusher_id = pusher_config.id
@@ -99,7 +189,7 @@ class Pusher(metaclass=abc.ABCMeta):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def on_new_receipts(self, min_stream_id: int, max_stream_id: int) -> None:
+    def on_new_receipts(self) -> None:
         raise NotImplementedError()
 
     @abc.abstractmethod

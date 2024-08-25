@@ -1,22 +1,31 @@
-# Copyright 2019 New Vector Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This file is licensed under the Affero General Public License (AGPL) version 3.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+#
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple, cast
 
-from synapse.http.servlet import parse_json_object_from_request
+from twisted.web.server import Request
+
+from synapse.http.server import HttpServer
 from synapse.replication.http._base import ReplicationEndpoint
+from synapse.types import JsonDict
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -39,23 +48,24 @@ class RegisterDeviceReplicationServlet(ReplicationEndpoint):
         self.registration_handler = hs.get_registration_handler()
 
     @staticmethod
-    async def _serialize_payload(
-        user_id,
-        device_id,
-        initial_display_name,
-        is_guest,
-        is_appservice_ghost,
-        should_issue_refresh_token,
-    ):
+    async def _serialize_payload(  # type: ignore[override]
+        user_id: str,
+        device_id: Optional[str],
+        initial_display_name: Optional[str],
+        is_guest: bool,
+        is_appservice_ghost: bool,
+        should_issue_refresh_token: bool,
+        auth_provider_id: Optional[str],
+        auth_provider_session_id: Optional[str],
+    ) -> JsonDict:
         """
         Args:
-            user_id (int)
-            device_id (str|None): Device ID to use, if None a new one is
-                generated.
-            initial_display_name (str|None)
-            is_guest (bool)
-            is_appservice_ghost (bool)
-            should_issue_refresh_token (bool)
+            user_id
+            device_id: Device ID to use, if None a new one is generated.
+            initial_display_name
+            is_guest
+            is_appservice_ghost
+            should_issue_refresh_token
         """
         return {
             "device_id": device_id,
@@ -63,16 +73,20 @@ class RegisterDeviceReplicationServlet(ReplicationEndpoint):
             "is_guest": is_guest,
             "is_appservice_ghost": is_appservice_ghost,
             "should_issue_refresh_token": should_issue_refresh_token,
+            "auth_provider_id": auth_provider_id,
+            "auth_provider_session_id": auth_provider_session_id,
         }
 
-    async def _handle_request(self, request, user_id):
-        content = parse_json_object_from_request(request)
-
+    async def _handle_request(  # type: ignore[override]
+        self, request: Request, content: JsonDict, user_id: str
+    ) -> Tuple[int, JsonDict]:
         device_id = content["device_id"]
         initial_display_name = content["initial_display_name"]
         is_guest = content["is_guest"]
         is_appservice_ghost = content["is_appservice_ghost"]
         should_issue_refresh_token = content["should_issue_refresh_token"]
+        auth_provider_id = content["auth_provider_id"]
+        auth_provider_session_id = content["auth_provider_session_id"]
 
         res = await self.registration_handler.register_device_inner(
             user_id,
@@ -81,10 +95,12 @@ class RegisterDeviceReplicationServlet(ReplicationEndpoint):
             is_guest,
             is_appservice_ghost=is_appservice_ghost,
             should_issue_refresh_token=should_issue_refresh_token,
+            auth_provider_id=auth_provider_id,
+            auth_provider_session_id=auth_provider_session_id,
         )
 
-        return 200, res
+        return 200, cast(JsonDict, res)
 
 
-def register_servlets(hs: "HomeServer", http_server):
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     RegisterDeviceReplicationServlet(hs).register(http_server)

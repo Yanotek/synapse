@@ -1,16 +1,23 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2020 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
 from typing import TYPE_CHECKING, Generator, List, Tuple
@@ -92,12 +99,21 @@ class AccountDetailsResource(DirectServeHtmlResource):
             self._sso_handler.render_error(request, "bad_session", e.msg, code=e.code)
             return
 
+        # The configuration might mandate going through this step to validate an
+        # automatically generated localpart, so session.chosen_localpart might already
+        # be set.
+        localpart = ""
+        if session.chosen_localpart is not None:
+            localpart = session.chosen_localpart
+
         idp_id = session.auth_provider_id
         template_params = {
             "idp": self._sso_handler.get_identity_providers()[idp_id],
             "user_attributes": {
                 "display_name": session.display_name,
                 "emails": session.emails,
+                "localpart": localpart,
+                "avatar_url": session.avatar_url,
             },
         }
 
@@ -119,6 +135,7 @@ class AccountDetailsResource(DirectServeHtmlResource):
         try:
             localpart = parse_string(request, "username", required=True)
             use_display_name = parse_boolean(request, "use_display_name", default=False)
+            use_avatar = parse_boolean(request, "use_avatar", default=False)
 
             try:
                 emails_to_use: List[str] = [
@@ -132,5 +149,5 @@ class AccountDetailsResource(DirectServeHtmlResource):
             return
 
         await self._sso_handler.handle_submit_username_request(
-            request, session_id, localpart, use_display_name, emails_to_use
+            request, session_id, localpart, use_display_name, use_avatar, emails_to_use
         )

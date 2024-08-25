@@ -1,17 +1,24 @@
-# Copyright 2019 New Vector
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This file is licensed under the Affero General Public License (AGPL) version 3.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+#
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import logging
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Tuple
 
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, MSC3244_CAPABILITIES
@@ -32,6 +39,7 @@ class CapabilitiesRestServlet(RestServlet):
     """End point to expose the capabilities of the server."""
 
     PATTERNS = client_patterns("/capabilities$")
+    CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
@@ -54,6 +62,18 @@ class CapabilitiesRestServlet(RestServlet):
                     },
                 },
                 "m.change_password": {"enabled": change_password},
+                "m.set_displayname": {
+                    "enabled": self.config.registration.enable_set_displayname
+                },
+                "m.set_avatar_url": {
+                    "enabled": self.config.registration.enable_set_avatar_url
+                },
+                "m.3pid_changes": {
+                    "enabled": self.config.registration.enable_3pid_changes
+                },
+                "m.get_login_token": {
+                    "enabled": self.config.auth.login_via_existing_enabled,
+                },
             }
         }
 
@@ -62,18 +82,17 @@ class CapabilitiesRestServlet(RestServlet):
                 "org.matrix.msc3244.room_capabilities"
             ] = MSC3244_CAPABILITIES
 
-        if self.config.experimental.msc3283_enabled:
-            response["capabilities"]["org.matrix.msc3283.set_displayname"] = {
-                "enabled": self.config.registration.enable_set_displayname
-            }
-            response["capabilities"]["org.matrix.msc3283.set_avatar_url"] = {
-                "enabled": self.config.registration.enable_set_avatar_url
-            }
-            response["capabilities"]["org.matrix.msc3283.3pid_changes"] = {
-                "enabled": self.config.registration.enable_3pid_changes
+        if self.config.experimental.msc3720_enabled:
+            response["capabilities"]["org.matrix.msc3720.account_status"] = {
+                "enabled": True,
             }
 
-        return 200, response
+        if self.config.experimental.msc3664_enabled:
+            response["capabilities"]["im.nheko.msc3664.related_event_match"] = {
+                "enabled": self.config.experimental.msc3664_enabled,
+            }
+
+        return HTTPStatus.OK, response
 
 
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:

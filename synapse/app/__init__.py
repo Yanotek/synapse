@@ -1,33 +1,43 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2014-2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import logging
 import sys
+from typing import Container
 
-from synapse import python_dependencies  # noqa: E402
+from synapse.util import check_dependencies
 
 logger = logging.getLogger(__name__)
 
 try:
-    python_dependencies.check_requirements()
-except python_dependencies.DependencyException as e:
+    check_dependencies.check_requirements()
+except check_dependencies.DependencyException as e:
     sys.stderr.writelines(
         e.message  # noqa: B306, DependencyException.message is a property
     )
     sys.exit(1)
 
 
-def check_bind_error(e, address, bind_addresses):
+def check_bind_error(
+    e: Exception, address: str, bind_addresses: Container[str]
+) -> None:
     """
     This method checks an exception occurred while binding on 0.0.0.0.
     If :: is specified in the bind addresses a warning is shown.
@@ -38,9 +48,9 @@ def check_bind_error(e, address, bind_addresses):
     When binding on 0.0.0.0 after :: this can safely be ignored.
 
     Args:
-        e (Exception): Exception that was caught.
-        address (str): Address on which binding was attempted.
-        bind_addresses (list): Addresses on which the service listens.
+        e: Exception that was caught.
+        address: Address on which binding was attempted.
+        bind_addresses: Addresses on which the service listens.
     """
     if address == "0.0.0.0" and "::" in bind_addresses:
         logger.warning(

@@ -1,25 +1,33 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 #  Copyright 2020 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import logging
 import math
 import resource
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Mapping, Sized, Tuple
 
 from prometheus_client import Gauge
 
 from synapse.metrics.background_process_metrics import wrap_as_background_process
+from synapse.types import JsonDict
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -28,26 +36,42 @@ logger = logging.getLogger("synapse.app.homeserver")
 
 # Contains the list of processes we will be monitoring
 # currently either 0 or 1
-_stats_process = []
+_stats_process: List[Tuple[int, "resource.struct_rusage"]] = []
 
 # Gauges to expose monthly active user control metrics
-current_mau_gauge = Gauge("synapse_admin_mau:current", "Current MAU")
+current_mau_gauge = Gauge("synapse_admin_mau_current", "Current MAU")
 current_mau_by_service_gauge = Gauge(
     "synapse_admin_mau_current_mau_by_service",
     "Current MAU by service",
     ["app_service"],
 )
-max_mau_gauge = Gauge("synapse_admin_mau:max", "MAU Limit")
+max_mau_gauge = Gauge("synapse_admin_mau_max", "MAU Limit")
 registered_reserved_users_mau_gauge = Gauge(
-    "synapse_admin_mau:registered_reserved_users",
+    "synapse_admin_mau_registered_reserved_users",
     "Registered users with reserved threepids",
 )
 
 
 @wrap_as_background_process("phone_stats_home")
-async def phone_stats_home(hs: "HomeServer", stats, stats_process=_stats_process):
+async def phone_stats_home(
+    hs: "HomeServer",
+    stats: JsonDict,
+    stats_process: List[Tuple[int, "resource.struct_rusage"]] = _stats_process,
+) -> None:
+    """Collect usage statistics and send them to the configured endpoint.
+
+    Args:
+        hs: the HomeServer object to use for gathering usage data.
+        stats: the dict in which to store the statistics sent to the configured
+            endpoint. Mostly used in tests to figure out the data that is supposed to
+            be sent.
+        stats_process: statistics about resource usage of the process.
+    """
+
     logger.info("Gathering stats for reporting")
     now = int(hs.get_clock().time())
+    # Ensure the homeserver has started.
+    assert hs.start_time is not None
     uptime = int(now - hs.start_time)
     if uptime < 0:
         uptime = 0
@@ -75,7 +99,8 @@ async def phone_stats_home(hs: "HomeServer", stats, stats_process=_stats_process
     # General statistics
     #
 
-    store = hs.get_datastore()
+    store = hs.get_datastores().main
+    common_metrics = await hs.get_common_usage_metrics_manager().get_metrics()
 
     stats["homeserver"] = hs.config.server.server_name
     stats["server_context"] = hs.config.server.server_context
@@ -97,7 +122,7 @@ async def phone_stats_home(hs: "HomeServer", stats, stats_process=_stats_process
     room_count = await store.get_room_count()
     stats["total_room_count"] = room_count
 
-    stats["daily_active_users"] = await store.count_daily_users()
+    stats["daily_active_users"] = common_metrics.daily_active_users
     stats["monthly_active_users"] = await store.count_monthly_users()
     daily_active_e2ee_rooms = await store.count_daily_active_e2ee_rooms()
     stats["daily_active_e2ee_rooms"] = daily_active_e2ee_rooms
@@ -108,10 +133,6 @@ async def phone_stats_home(hs: "HomeServer", stats, stats_process=_stats_process
     stats["daily_messages"] = await store.count_daily_messages()
     daily_sent_messages = await store.count_daily_sent_messages()
     stats["daily_sent_messages"] = daily_sent_messages
-
-    r30_results = await store.count_r30_users()
-    for name, count in r30_results.items():
-        stats["r30_users_" + name] = count
 
     r30v2_results = await store.count_r30v2_users()
     for name, count in r30v2_results.items():
@@ -146,15 +167,15 @@ async def phone_stats_home(hs: "HomeServer", stats, stats_process=_stats_process
         logger.warning("Error reporting stats: %s", e)
 
 
-def start_phone_stats_home(hs: "HomeServer"):
+def start_phone_stats_home(hs: "HomeServer") -> None:
     """
     Start the background tasks which report phone home stats.
     """
     clock = hs.get_clock()
 
-    stats = {}
+    stats: JsonDict = {}
 
-    def performance_stats_init():
+    def performance_stats_init() -> None:
         _stats_process.clear()
         _stats_process.append(
             (int(hs.get_clock().time()), resource.getrusage(resource.RUSAGE_SELF))
@@ -163,18 +184,22 @@ def start_phone_stats_home(hs: "HomeServer"):
     # Rather than update on per session basis, batch up the requests.
     # If you increase the loop period, the accuracy of user_daily_visits
     # table will decrease
-    clock.looping_call(hs.get_datastore().generate_user_daily_visits, 5 * 60 * 1000)
+    clock.looping_call(
+        hs.get_datastores().main.generate_user_daily_visits, 5 * 60 * 1000
+    )
 
     # monthly active user limiting functionality
-    clock.looping_call(hs.get_datastore().reap_monthly_active_users, 1000 * 60 * 60)
-    hs.get_datastore().reap_monthly_active_users()
+    clock.looping_call(
+        hs.get_datastores().main.reap_monthly_active_users, 1000 * 60 * 60
+    )
+    hs.get_datastores().main.reap_monthly_active_users()
 
     @wrap_as_background_process("generate_monthly_active_users")
-    async def generate_monthly_active_users():
+    async def generate_monthly_active_users() -> None:
         current_mau_count = 0
-        current_mau_count_by_service = {}
-        reserved_users = ()
-        store = hs.get_datastore()
+        current_mau_count_by_service: Mapping[str, int] = {}
+        reserved_users: Sized = ()
+        store = hs.get_datastores().main
         if hs.config.server.limit_usage_by_mau or hs.config.server.mau_stats_only:
             current_mau_count = await store.get_monthly_active_count()
             current_mau_count_by_service = (

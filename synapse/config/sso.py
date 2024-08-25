@@ -1,20 +1,29 @@
-# Copyright 2020 The Matrix.org Foundation C.I.C.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This file is licensed under the Affero General Public License (AGPL) version 3.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# Copyright 2020-2021 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+#
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import logging
 from typing import Any, Dict, Optional
 
 import attr
+
+from synapse.types import JsonDict
 
 from ._base import Config
 
@@ -24,18 +33,18 @@ LEGACY_TEMPLATE_DIR_WARNING = """
 This server's configuration file is using the deprecated 'template_dir' setting in the
 'sso' section. Support for this setting has been deprecated and will be removed in a
 future version of Synapse. Server admins should instead use the new
-'custom_templates_directory' setting documented here:
-https://matrix-org.github.io/synapse/latest/templates.html
+'custom_template_directory' setting documented here:
+https://element-hq.github.io/synapse/latest/templates.html
 ---------------------------------------------------------------------------------------"""
 
 
-@attr.s(frozen=True)
+@attr.s(frozen=True, auto_attribs=True)
 class SsoAttributeRequirement:
     """Object describing a single requirement for SSO attributes."""
 
-    attribute = attr.ib(type=str)
+    attribute: str
     # If a value is not given, than the attribute must simply exist.
-    value = attr.ib(type=Optional[str])
+    value: Optional[str]
 
     JSON_SCHEMA = {
         "type": "object",
@@ -49,7 +58,7 @@ class SSOConfig(Config):
 
     section = "sso"
 
-    def read_config(self, config, **kwargs):
+    def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         sso_config: Dict[str, Any] = config.get("sso") or {}
 
         # The sso-specific template_dir
@@ -101,51 +110,7 @@ class SSOConfig(Config):
         # gracefully to the client). This would make it pointless to ask the user for
         # confirmation, since the URL the confirmation page would be showing wouldn't be
         # the client's.
-        # public_baseurl is an optional setting, so we only add the fallback's URL to the
-        # list if it's provided (because we can't figure out what that URL is otherwise).
-        if self.root.server.public_baseurl:
-            login_fallback_url = (
-                self.root.server.public_baseurl + "_matrix/static/client/login"
-            )
-            self.sso_client_whitelist.append(login_fallback_url)
-
-    def generate_config_section(self, **kwargs):
-        return """\
-        # Additional settings to use with single-sign on systems such as OpenID Connect,
-        # SAML2 and CAS.
-        #
-        # Server admins can configure custom templates for pages related to SSO. See
-        # https://matrix-org.github.io/synapse/latest/templates.html for more information.
-        #
-        sso:
-            # A list of client URLs which are whitelisted so that the user does not
-            # have to confirm giving access to their account to the URL. Any client
-            # whose URL starts with an entry in the following list will not be subject
-            # to an additional confirmation step after the SSO login is completed.
-            #
-            # WARNING: An entry such as "https://my.client" is insecure, because it
-            # will also match "https://my.client.evil.site", exposing your users to
-            # phishing attacks from evil.site. To avoid this, include a slash after the
-            # hostname: "https://my.client/".
-            #
-            # If public_baseurl is set, then the login fallback page (used by clients
-            # that don't natively support the required login flows) is whitelisted in
-            # addition to any URLs in this list.
-            #
-            # By default, this list is empty.
-            #
-            #client_whitelist:
-            #  - https://riot.im/develop
-            #  - https://my.custom.client/
-
-            # Uncomment to keep a user's profile fields in sync with information from
-            # the identity provider. Currently only syncing the displayname is
-            # supported. Fields are checked on every SSO login, and are updated
-            # if necessary.
-            #
-            # Note that enabling this option will override user profile information,
-            # regardless of whether users have opted-out of syncing that
-            # information when first signing in. Defaults to false.
-            #
-            #update_profile_information: true
-        """
+        login_fallback_url = (
+            self.root.server.public_baseurl + "_matrix/static/client/login"
+        )
+        self.sso_client_whitelist.append(login_fallback_url)

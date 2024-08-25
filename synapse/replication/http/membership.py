@@ -1,22 +1,28 @@
-# Copyright 2018 New Vector Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This file is licensed under the Affero General Public License (AGPL) version 3.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+#
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from twisted.web.server import Request
 
-from synapse.http.servlet import parse_json_object_from_request
+from synapse.http.server import HttpServer
 from synapse.http.site import SynapseRequest
 from synapse.replication.http._base import ReplicationEndpoint
 from synapse.types import JsonDict, Requester, UserID
@@ -49,11 +55,11 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
         super().__init__(hs)
 
         self.federation_handler = hs.get_federation_handler()
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
 
     @staticmethod
-    async def _serialize_payload(  # type: ignore
+    async def _serialize_payload(  # type: ignore[override]
         requester: Requester,
         room_id: str,
         user_id: str,
@@ -77,11 +83,9 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
             "content": content,
         }
 
-    async def _handle_request(  # type: ignore
-        self, request: SynapseRequest, room_id: str, user_id: str
+    async def _handle_request(  # type: ignore[override]
+        self, request: SynapseRequest, content: JsonDict, room_id: str, user_id: str
     ) -> Tuple[int, JsonDict]:
-        content = parse_json_object_from_request(request)
-
         remote_room_hosts = content["remote_room_hosts"]
         event_content = content["content"]
 
@@ -118,17 +122,17 @@ class ReplicationRemoteKnockRestServlet(ReplicationEndpoint):
         super().__init__(hs)
 
         self.federation_handler = hs.get_federation_handler()
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
 
     @staticmethod
-    async def _serialize_payload(  # type: ignore
+    async def _serialize_payload(  # type: ignore[override]
         requester: Requester,
         room_id: str,
         user_id: str,
         remote_room_hosts: List[str],
         content: JsonDict,
-    ):
+    ) -> JsonDict:
         """
         Args:
             requester: The user making the request, according to the access token.
@@ -143,19 +147,13 @@ class ReplicationRemoteKnockRestServlet(ReplicationEndpoint):
             "content": content,
         }
 
-    async def _handle_request(  # type: ignore
-        self,
-        request: SynapseRequest,
-        room_id: str,
-        user_id: str,
-    ):
-        content = parse_json_object_from_request(request)
-
+    async def _handle_request(  # type: ignore[override]
+        self, request: SynapseRequest, content: JsonDict, room_id: str, user_id: str
+    ) -> Tuple[int, JsonDict]:
         remote_room_hosts = content["remote_room_hosts"]
         event_content = content["content"]
 
         requester = Requester.deserialize(self.store, content["requester"])
-
         request.requester = requester
 
         logger.debug("remote_knock: %s on room: %s", user_id, room_id)
@@ -187,12 +185,12 @@ class ReplicationRemoteRejectInviteRestServlet(ReplicationEndpoint):
     def __init__(self, hs: "HomeServer"):
         super().__init__(hs)
 
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
         self.member_handler = hs.get_room_member_handler()
 
     @staticmethod
-    async def _serialize_payload(  # type: ignore
+    async def _serialize_payload(  # type: ignore[override]
         invite_event_id: str,
         txn_id: Optional[str],
         requester: Requester,
@@ -215,11 +213,9 @@ class ReplicationRemoteRejectInviteRestServlet(ReplicationEndpoint):
             "content": content,
         }
 
-    async def _handle_request(  # type: ignore
-        self, request: SynapseRequest, invite_event_id: str
+    async def _handle_request(  # type: ignore[override]
+        self, request: SynapseRequest, content: JsonDict, invite_event_id: str
     ) -> Tuple[int, JsonDict]:
-        content = parse_json_object_from_request(request)
-
         txn_id = content["txn_id"]
         event_content = content["content"]
 
@@ -257,17 +253,17 @@ class ReplicationRemoteRescindKnockRestServlet(ReplicationEndpoint):
     def __init__(self, hs: "HomeServer"):
         super().__init__(hs)
 
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
         self.member_handler = hs.get_room_member_handler()
 
     @staticmethod
-    async def _serialize_payload(  # type: ignore
+    async def _serialize_payload(  # type: ignore[override]
         knock_event_id: str,
         txn_id: Optional[str],
         requester: Requester,
         content: JsonDict,
-    ):
+    ) -> JsonDict:
         """
         Args:
             knock_event_id: The ID of the knock to be rescinded.
@@ -281,18 +277,13 @@ class ReplicationRemoteRescindKnockRestServlet(ReplicationEndpoint):
             "content": content,
         }
 
-    async def _handle_request(  # type: ignore
-        self,
-        request: SynapseRequest,
-        knock_event_id: str,
-    ):
-        content = parse_json_object_from_request(request)
-
+    async def _handle_request(  # type: ignore[override]
+        self, request: SynapseRequest, content: JsonDict, knock_event_id: str
+    ) -> Tuple[int, JsonDict]:
         txn_id = content["txn_id"]
         event_content = content["content"]
 
         requester = Requester.deserialize(self.store, content["requester"])
-
         request.requester = requester
 
         # hopefully we're now on the master, so this won't recurse!
@@ -324,12 +315,12 @@ class ReplicationUserJoinedLeftRoomRestServlet(ReplicationEndpoint):
         super().__init__(hs)
 
         self.registeration_handler = hs.get_registration_handler()
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
         self.distributor = hs.get_distributor()
 
     @staticmethod
-    async def _serialize_payload(  # type: ignore
+    async def _serialize_payload(  # type: ignore[override]
         room_id: str, user_id: str, change: str
     ) -> JsonDict:
         """
@@ -345,8 +336,13 @@ class ReplicationUserJoinedLeftRoomRestServlet(ReplicationEndpoint):
 
         return {}
 
-    async def _handle_request(  # type: ignore
-        self, request: Request, room_id: str, user_id: str, change: str
+    async def _handle_request(  # type: ignore[override]
+        self,
+        request: Request,
+        content: JsonDict,
+        room_id: str,
+        user_id: str,
+        change: str,
     ) -> Tuple[int, JsonDict]:
         logger.info("user membership change: %s in %s", user_id, room_id)
 
@@ -360,7 +356,9 @@ class ReplicationUserJoinedLeftRoomRestServlet(ReplicationEndpoint):
         return 200, {}
 
 
-def register_servlets(hs: "HomeServer", http_server):
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     ReplicationRemoteJoinRestServlet(hs).register(http_server)
     ReplicationRemoteRejectInviteRestServlet(hs).register(http_server)
     ReplicationUserJoinedLeftRoomRestServlet(hs).register(http_server)
+    ReplicationRemoteKnockRestServlet(hs).register(http_server)
+    ReplicationRemoteRescindKnockRestServlet(hs).register(http_server)

@@ -1,16 +1,23 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2020 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import synapse
 from synapse.api.errors import Codes
 from synapse.rest.client import login, push_rule, room
@@ -27,7 +34,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
     ]
     hijack_auth = False
 
-    def test_enabled_on_creation(self):
+    def test_enabled_on_creation(self) -> None:
         """
         Tests the GET and PUT of push rules' `enabled` endpoints.
         Tests that a rule is enabled upon creation, even though a rule with that
@@ -56,7 +63,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 200)
         self.assertEqual(channel.json_body["enabled"], True)
 
-    def test_enabled_on_recreation(self):
+    def test_enabled_on_recreation(self) -> None:
         """
         Tests the GET and PUT of push rules' `enabled` endpoints.
         Tests that a rule is enabled upon creation, even if a rule with that
@@ -113,7 +120,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 200)
         self.assertEqual(channel.json_body["enabled"], True)
 
-    def test_enabled_disable(self):
+    def test_enabled_disable(self) -> None:
         """
         Tests the GET and PUT of push rules' `enabled` endpoints.
         Tests that a rule is disabled and enabled when we ask for it.
@@ -166,7 +173,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 200)
         self.assertEqual(channel.json_body["enabled"], True)
 
-    def test_enabled_404_when_get_non_existent(self):
+    def test_enabled_404_when_get_non_existent(self) -> None:
         """
         Tests that `enabled` gives 404 when the rule doesn't exist.
         """
@@ -212,7 +219,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 404)
         self.assertEqual(channel.json_body["errcode"], Codes.NOT_FOUND)
 
-    def test_enabled_404_when_get_non_existent_server_rule(self):
+    def test_enabled_404_when_get_non_existent_server_rule(self) -> None:
         """
         Tests that `enabled` gives 404 when the server-default rule doesn't exist.
         """
@@ -226,7 +233,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 404)
         self.assertEqual(channel.json_body["errcode"], Codes.NOT_FOUND)
 
-    def test_enabled_404_when_put_non_existent_rule(self):
+    def test_enabled_404_when_put_non_existent_rule(self) -> None:
         """
         Tests that `enabled` gives 404 when we put to a rule that doesn't exist.
         """
@@ -243,7 +250,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 404)
         self.assertEqual(channel.json_body["errcode"], Codes.NOT_FOUND)
 
-    def test_enabled_404_when_put_non_existent_server_rule(self):
+    def test_enabled_404_when_put_non_existent_server_rule(self) -> None:
         """
         Tests that `enabled` gives 404 when we put to a server-default rule that doesn't exist.
         """
@@ -260,7 +267,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 404)
         self.assertEqual(channel.json_body["errcode"], Codes.NOT_FOUND)
 
-    def test_actions_get(self):
+    def test_actions_get(self) -> None:
         """
         Tests that `actions` gives you what you expect on a fresh rule.
         """
@@ -289,7 +296,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
             channel.json_body["actions"], ["notify", {"set_tweak": "highlight"}]
         )
 
-    def test_actions_put(self):
+    def test_actions_put(self) -> None:
         """
         Tests that PUT on actions updates the value you'd get from GET.
         """
@@ -325,7 +332,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 200)
         self.assertEqual(channel.json_body["actions"], ["dont_notify"])
 
-    def test_actions_404_when_get_non_existent(self):
+    def test_actions_404_when_get_non_existent(self) -> None:
         """
         Tests that `actions` gives 404 when the rule doesn't exist.
         """
@@ -365,7 +372,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 404)
         self.assertEqual(channel.json_body["errcode"], Codes.NOT_FOUND)
 
-    def test_actions_404_when_get_non_existent_server_rule(self):
+    def test_actions_404_when_get_non_existent_server_rule(self) -> None:
         """
         Tests that `actions` gives 404 when the server-default rule doesn't exist.
         """
@@ -379,7 +386,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 404)
         self.assertEqual(channel.json_body["errcode"], Codes.NOT_FOUND)
 
-    def test_actions_404_when_put_non_existent_rule(self):
+    def test_actions_404_when_put_non_existent_rule(self) -> None:
         """
         Tests that `actions` gives 404 when putting to a rule that doesn't exist.
         """
@@ -396,7 +403,7 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         self.assertEqual(channel.code, 404)
         self.assertEqual(channel.json_body["errcode"], Codes.NOT_FOUND)
 
-    def test_actions_404_when_put_non_existent_server_rule(self):
+    def test_actions_404_when_put_non_existent_server_rule(self) -> None:
         """
         Tests that `actions` gives 404 when putting to a server-default rule that doesn't exist.
         """
@@ -412,3 +419,70 @@ class PushRuleAttributesTestCase(HomeserverTestCase):
         )
         self.assertEqual(channel.code, 404)
         self.assertEqual(channel.json_body["errcode"], Codes.NOT_FOUND)
+
+    def test_contains_user_name(self) -> None:
+        """
+        Tests that `contains_user_name` rule is present and have proper value in `pattern`.
+        """
+        username = "bob"
+        self.register_user(username, "pass")
+        token = self.login(username, "pass")
+
+        channel = self.make_request(
+            "GET",
+            "/pushrules/global/content/.m.rule.contains_user_name",
+            access_token=token,
+        )
+
+        self.assertEqual(channel.code, 200)
+
+        self.assertEqual(
+            {
+                "rule_id": ".m.rule.contains_user_name",
+                "default": True,
+                "enabled": True,
+                "pattern": username,
+                "actions": [
+                    "notify",
+                    {"set_tweak": "highlight"},
+                    {"set_tweak": "sound", "value": "default"},
+                ],
+            },
+            channel.json_body,
+        )
+
+    def test_is_user_mention(self) -> None:
+        """
+        Tests that `is_user_mention` rule is present and have proper value in `value`.
+        """
+        user = self.register_user("bob", "pass")
+        token = self.login("bob", "pass")
+
+        channel = self.make_request(
+            "GET",
+            "/pushrules/global/override/.m.rule.is_user_mention",
+            access_token=token,
+        )
+
+        self.assertEqual(channel.code, 200)
+
+        self.assertEqual(
+            {
+                "rule_id": ".m.rule.is_user_mention",
+                "default": True,
+                "enabled": True,
+                "conditions": [
+                    {
+                        "kind": "event_property_contains",
+                        "key": "content.m\\.mentions.user_ids",
+                        "value": user,
+                    }
+                ],
+                "actions": [
+                    "notify",
+                    {"set_tweak": "highlight"},
+                    {"set_tweak": "sound", "value": "default"},
+                ],
+            },
+            channel.json_body,
+        )

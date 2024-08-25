@@ -1,16 +1,23 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2015, 2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
 from typing import TYPE_CHECKING
@@ -62,7 +69,7 @@ class AuthRestServlet(RestServlet):
         if stagetype == LoginType.RECAPTCHA:
             html = self.recaptcha_template.render(
                 session=session,
-                myurl="%s/r0/auth/%s/fallback/web"
+                myurl="%s/v3/auth/%s/fallback/web"
                 % (CLIENT_API_PREFIX, LoginType.RECAPTCHA),
                 sitekey=self.hs.config.captcha.recaptcha_public_key,
             )
@@ -74,7 +81,7 @@ class AuthRestServlet(RestServlet):
                     self.hs.config.server.public_baseurl,
                     self.hs.config.consent.user_consent_version,
                 ),
-                myurl="%s/r0/auth/%s/fallback/web"
+                myurl="%s/v3/auth/%s/fallback/web"
                 % (CLIENT_API_PREFIX, LoginType.TERMS),
             )
 
@@ -97,7 +104,6 @@ class AuthRestServlet(RestServlet):
         return None
 
     async def on_POST(self, request: Request, stagetype: str) -> None:
-
         session = parse_string(request, "session")
         if not session:
             raise SynapseError(400, "No session supplied")
@@ -112,13 +118,13 @@ class AuthRestServlet(RestServlet):
 
             try:
                 await self.auth_handler.add_oob_auth(
-                    LoginType.RECAPTCHA, authdict, request.getClientIP()
+                    LoginType.RECAPTCHA, authdict, request.getClientAddress().host
                 )
             except LoginError as e:
                 # Authentication failed, let user try again
                 html = self.recaptcha_template.render(
                     session=session,
-                    myurl="%s/r0/auth/%s/fallback/web"
+                    myurl="%s/v3/auth/%s/fallback/web"
                     % (CLIENT_API_PREFIX, LoginType.RECAPTCHA),
                     sitekey=self.hs.config.captcha.recaptcha_public_key,
                     error=e.msg,
@@ -132,7 +138,7 @@ class AuthRestServlet(RestServlet):
 
             try:
                 await self.auth_handler.add_oob_auth(
-                    LoginType.TERMS, authdict, request.getClientIP()
+                    LoginType.TERMS, authdict, request.getClientAddress().host
                 )
             except LoginError as e:
                 # Authentication failed, let user try again
@@ -143,7 +149,7 @@ class AuthRestServlet(RestServlet):
                         self.hs.config.server.public_baseurl,
                         self.hs.config.consent.user_consent_version,
                     ),
-                    myurl="%s/r0/auth/%s/fallback/web"
+                    myurl="%s/v3/auth/%s/fallback/web"
                     % (CLIENT_API_PREFIX, LoginType.TERMS),
                     error=e.msg,
                 )
@@ -161,7 +167,9 @@ class AuthRestServlet(RestServlet):
 
             try:
                 await self.auth_handler.add_oob_auth(
-                    LoginType.REGISTRATION_TOKEN, authdict, request.getClientIP()
+                    LoginType.REGISTRATION_TOKEN,
+                    authdict,
+                    request.getClientAddress().host,
                 )
             except LoginError as e:
                 html = self.registration_token_template.render(

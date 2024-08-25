@@ -1,27 +1,35 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2021 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from prometheus_client import Counter, Histogram
 
+from synapse.logging import opentracing
 from synapse.logging.context import make_deferred_yieldable
 from synapse.util import json_decoder, json_encoder
 
 if TYPE_CHECKING:
-    from txredisapi import RedisProtocol
+    from txredisapi import ConnectionHandler
 
     from synapse.server import HomeServer
 
@@ -62,9 +70,9 @@ class ExternalCache:
 
     def __init__(self, hs: "HomeServer"):
         if hs.config.redis.redis_enabled:
-            self._redis_connection: Optional[
-                "RedisProtocol"
-            ] = hs.get_outbound_redis_connection()
+            self._redis_connection: Optional["ConnectionHandler"] = (
+                hs.get_outbound_redis_connection()
+            )
         else:
             self._redis_connection = None
 
@@ -93,14 +101,18 @@ class ExternalCache:
 
         logger.debug("Caching %s %s: %r", cache_name, key, encoded_value)
 
-        with response_timer.labels("set").time():
-            return await make_deferred_yieldable(
-                self._redis_connection.set(
-                    self._get_redis_key(cache_name, key),
-                    encoded_value,
-                    pexpire=expiry_ms,
+        with opentracing.start_active_span(
+            "ExternalCache.set",
+            tags={opentracing.SynapseTags.CACHE_NAME: cache_name},
+        ):
+            with response_timer.labels("set").time():
+                return await make_deferred_yieldable(
+                    self._redis_connection.set(
+                        self._get_redis_key(cache_name, key),
+                        encoded_value,
+                        pexpire=expiry_ms,
+                    )
                 )
-            )
 
     async def get(self, cache_name: str, key: str) -> Optional[Any]:
         """Look up a key/value in the named cache."""
@@ -108,10 +120,14 @@ class ExternalCache:
         if self._redis_connection is None:
             return None
 
-        with response_timer.labels("get").time():
-            result = await make_deferred_yieldable(
-                self._redis_connection.get(self._get_redis_key(cache_name, key))
-            )
+        with opentracing.start_active_span(
+            "ExternalCache.get",
+            tags={opentracing.SynapseTags.CACHE_NAME: cache_name},
+        ):
+            with response_timer.labels("get").time():
+                result = await make_deferred_yieldable(
+                    self._redis_connection.get(self._get_redis_key(cache_name, key))
+                )
 
         logger.debug("Got cache result %s %s: %r", cache_name, key, result)
 

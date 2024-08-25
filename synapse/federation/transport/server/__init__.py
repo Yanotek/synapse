@@ -1,19 +1,26 @@
-# Copyright 2014-2021 The Matrix.org Foundation C.I.C.
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2020 Sorunome
+# Copyright 2014-2021 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import logging
-from typing import Dict, Iterable, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Type
 
 from typing_extensions import Literal
 
@@ -22,10 +29,12 @@ from synapse.federation.transport.server._base import (
     Authenticator,
     BaseFederationServlet,
 )
-from synapse.federation.transport.server.federation import FEDERATION_SERVLET_CLASSES
-from synapse.federation.transport.server.groups_local import GROUP_LOCAL_SERVLET_CLASSES
-from synapse.federation.transport.server.groups_server import (
-    GROUP_SERVER_SERVLET_CLASSES,
+from synapse.federation.transport.server.federation import (
+    FEDERATION_SERVLET_CLASSES,
+    FederationAccountStatusServlet,
+    FederationMediaDownloadServlet,
+    FederationMediaThumbnailServlet,
+    FederationUnstableClientKeysClaimServlet,
 )
 from synapse.http.server import HttpServer, JsonResource
 from synapse.http.servlet import (
@@ -33,9 +42,11 @@ from synapse.http.servlet import (
     parse_integer_from_args,
     parse_string_from_args,
 )
-from synapse.server import HomeServer
 from synapse.types import JsonDict, ThirdPartyInstanceID
 from synapse.util.ratelimitutils import FederationRateLimiter
+
+if TYPE_CHECKING:
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +54,7 @@ logger = logging.getLogger(__name__)
 class TransportLayerServer(JsonResource):
     """Handles incoming federation HTTP requests"""
 
-    def __init__(self, hs: HomeServer, servlet_groups: Optional[List[str]] = None):
+    def __init__(self, hs: "HomeServer", servlet_groups: Optional[List[str]] = None):
         """Initialize the TransportLayerServer
 
         Will by default register all servlets. For custom behaviour, pass in
@@ -107,10 +118,11 @@ class PublicRoomList(BaseFederationServlet):
     """
 
     PATH = "/publicRooms"
+    CATEGORY = "Federation requests"
 
     def __init__(
         self,
-        hs: HomeServer,
+        hs: "HomeServer",
         authenticator: Authenticator,
         ratelimiter: FederationRateLimiter,
         server_name: str,
@@ -146,7 +158,10 @@ class PublicRoomList(BaseFederationServlet):
             limit = None
 
         data = await self.handler.get_local_public_room_list(
-            limit, since_token, network_tuple=network_tuple, from_federation=True
+            limit,
+            since_token,
+            network_tuple=network_tuple,
+            from_federation_origin=origin,
         )
         return 200, data
 
@@ -187,42 +202,10 @@ class PublicRoomList(BaseFederationServlet):
             since_token=since_token,
             search_filter=search_filter,
             network_tuple=network_tuple,
-            from_federation=True,
+            from_federation_origin=origin,
         )
 
         return 200, data
-
-
-class FederationGroupsRenewAttestaionServlet(BaseFederationServlet):
-    """A group or user's server renews their attestation"""
-
-    PATH = "/groups/(?P<group_id>[^/]*)/renew_attestation/(?P<user_id>[^/]*)"
-
-    def __init__(
-        self,
-        hs: HomeServer,
-        authenticator: Authenticator,
-        ratelimiter: FederationRateLimiter,
-        server_name: str,
-    ):
-        super().__init__(hs, authenticator, ratelimiter, server_name)
-        self.handler = hs.get_groups_attestation_renewer()
-
-    async def on_POST(
-        self,
-        origin: str,
-        content: JsonDict,
-        query: Dict[bytes, List[bytes]],
-        group_id: str,
-        user_id: str,
-    ) -> Tuple[int, JsonDict]:
-        # We don't need to check auth here as we check the attestation signatures
-
-        new_content = await self.handler.on_renew_attestation(
-            group_id, user_id, content
-        )
-
-        return 200, new_content
 
 
 class OpenIdUserInfo(BaseFederationServlet):
@@ -243,12 +226,13 @@ class OpenIdUserInfo(BaseFederationServlet):
     """
 
     PATH = "/openid/userinfo"
+    CATEGORY = "Federation requests"
 
     REQUIRE_AUTH = False
 
     def __init__(
         self,
-        hs: HomeServer,
+        hs: "HomeServer",
         authenticator: Authenticator,
         ratelimiter: FederationRateLimiter,
         server_name: str,
@@ -283,23 +267,24 @@ class OpenIdUserInfo(BaseFederationServlet):
         return 200, {"sub": user_id}
 
 
-DEFAULT_SERVLET_GROUPS: Dict[str, Iterable[Type[BaseFederationServlet]]] = {
+SERVLET_GROUPS: Dict[str, Iterable[Type[BaseFederationServlet]]] = {
     "federation": FEDERATION_SERVLET_CLASSES,
     "room_list": (PublicRoomList,),
-    "group_server": GROUP_SERVER_SERVLET_CLASSES,
-    "group_local": GROUP_LOCAL_SERVLET_CLASSES,
-    "group_attestation": (FederationGroupsRenewAttestaionServlet,),
     "openid": (OpenIdUserInfo,),
+    "media": (
+        FederationMediaDownloadServlet,
+        FederationMediaThumbnailServlet,
+    ),
 }
 
 
 def register_servlets(
-    hs: HomeServer,
+    hs: "HomeServer",
     resource: HttpServer,
     authenticator: Authenticator,
     ratelimiter: FederationRateLimiter,
     servlet_groups: Optional[Iterable[str]] = None,
-):
+) -> None:
     """Initialize and register servlet classes.
 
     Will by default register all servlets. For custom behaviour, pass in
@@ -314,16 +299,35 @@ def register_servlets(
             Defaults to ``DEFAULT_SERVLET_GROUPS``.
     """
     if not servlet_groups:
-        servlet_groups = DEFAULT_SERVLET_GROUPS.keys()
+        servlet_groups = SERVLET_GROUPS.keys()
 
     for servlet_group in servlet_groups:
         # Skip unknown servlet groups.
-        if servlet_group not in DEFAULT_SERVLET_GROUPS:
+        if servlet_group not in SERVLET_GROUPS:
             raise RuntimeError(
                 f"Attempting to register unknown federation servlet: '{servlet_group}'"
             )
 
-        for servletclass in DEFAULT_SERVLET_GROUPS[servlet_group]:
+        for servletclass in SERVLET_GROUPS[servlet_group]:
+            # Only allow the `/account_status` servlet if msc3720 is enabled
+            if (
+                servletclass == FederationAccountStatusServlet
+                and not hs.config.experimental.msc3720_enabled
+            ):
+                continue
+            if (
+                servletclass == FederationUnstableClientKeysClaimServlet
+                and not hs.config.experimental.msc3983_appservice_otk_claims
+            ):
+                continue
+
+            if (
+                servletclass == FederationMediaDownloadServlet
+                or servletclass == FederationMediaThumbnailServlet
+            ):
+                if not hs.config.media.can_load_media_repo:
+                    continue
+
             servletclass(
                 hs=hs,
                 authenticator=authenticator,

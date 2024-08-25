@@ -1,28 +1,36 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2014-2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
 import random
 from typing import TYPE_CHECKING, Iterable, List, Optional
 
-from synapse.api.constants import EduTypes, EventTypes, Membership
+from synapse.api.constants import EduTypes, EventTypes, Membership, PresenceState
 from synapse.api.errors import AuthError, SynapseError
 from synapse.events import EventBase
+from synapse.events.utils import SerializeEventConfig
 from synapse.handlers.presence import format_user_presence_state
-from synapse.logging.utils import log_function
+from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.streams.config import PaginationConfig
-from synapse.types import JsonDict, UserID
+from synapse.types import JsonDict, Requester, UserID
 from synapse.visibility import filter_events_for_client
 
 if TYPE_CHECKING:
@@ -34,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 class EventStreamHandler:
     def __init__(self, hs: "HomeServer"):
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
         self.hs = hs
 
@@ -43,16 +51,14 @@ class EventStreamHandler:
         self._server_notices_sender = hs.get_server_notices_sender()
         self._event_serializer = hs.get_event_client_serializer()
 
-    @log_function
     async def get_stream(
         self,
-        auth_user_id: str,
+        requester: Requester,
         pagin_config: PaginationConfig,
         timeout: int = 0,
         as_client_event: bool = True,
         affect_presence: bool = True,
         room_id: Optional[str] = None,
-        is_guest: bool = False,
     ) -> JsonDict:
         """Fetches the events stream for a given user."""
 
@@ -62,13 +68,15 @@ class EventStreamHandler:
                 raise SynapseError(403, "This room has been blocked on this server")
 
         # send any outstanding server notices to the user.
-        await self._server_notices_sender.on_user_syncing(auth_user_id)
+        await self._server_notices_sender.on_user_syncing(requester.user.to_string())
 
-        auth_user = UserID.from_string(auth_user_id)
         presence_handler = self.hs.get_presence_handler()
 
         context = await presence_handler.user_syncing(
-            auth_user_id, affect_presence=affect_presence
+            requester.user.to_string(),
+            requester.device_id,
+            affect_presence=affect_presence,
+            presence_state=PresenceState.ONLINE,
         )
         with context:
             if timeout:
@@ -79,13 +87,14 @@ class EventStreamHandler:
                 # thundering herds on restart.
                 timeout = random.randint(int(timeout * 0.9), int(timeout * 1.1))
 
-            events, tokens = await self.notifier.get_events_for(
-                auth_user,
+            stream_result = await self.notifier.get_events_for(
+                requester.user,
                 pagin_config,
                 timeout,
-                is_guest=is_guest,
+                is_guest=requester.is_guest,
                 explicit_room_id=room_id,
             )
+            events = stream_result.events
 
             time_now = self.clock.time_msec()
 
@@ -99,7 +108,7 @@ class EventStreamHandler:
                     if event.membership != Membership.JOIN:
                         continue
                     # Send down presence.
-                    if event.state_key == auth_user_id:
+                    if event.state_key == requester.user.to_string():
                         # Send down presence for everyone in the room.
                         users: Iterable[str] = await self.store.get_users_in_room(
                             event.room_id
@@ -110,7 +119,7 @@ class EventStreamHandler:
                     states = await presence_handler.get_states(users)
                     to_add.extend(
                         {
-                            "type": EduTypes.Presence,
+                            "type": EduTypes.PRESENCE,
                             "content": format_user_presence_state(state, time_now),
                         }
                         for state in states
@@ -121,16 +130,15 @@ class EventStreamHandler:
             chunks = await self._event_serializer.serialize_events(
                 events,
                 time_now,
-                as_client_event=as_client_event,
-                # We don't bundle "live" events, as otherwise clients
-                # will end up double counting annotations.
-                bundle_aggregations=False,
+                config=SerializeEventConfig(
+                    as_client_event=as_client_event, requester=requester
+                ),
             )
 
             chunk = {
                 "chunk": chunks,
-                "start": await tokens[0].to_string(self.store),
-                "end": await tokens[1].to_string(self.store),
+                "start": await stream_result.start_token.to_string(self.store),
+                "end": await stream_result.end_token.to_string(self.store),
             }
 
             return chunk
@@ -138,36 +146,53 @@ class EventStreamHandler:
 
 class EventHandler:
     def __init__(self, hs: "HomeServer"):
-        self.store = hs.get_datastore()
-        self.storage = hs.get_storage()
+        self.store = hs.get_datastores().main
+        self._storage_controllers = hs.get_storage_controllers()
 
     async def get_event(
-        self, user: UserID, room_id: Optional[str], event_id: str
+        self,
+        user: UserID,
+        room_id: Optional[str],
+        event_id: str,
+        show_redacted: bool = False,
     ) -> Optional[EventBase]:
         """Retrieve a single specified event.
 
         Args:
-            user: The user requesting the event
+            user: The local user requesting the event
             room_id: The expected room id. We'll return None if the
                 event's room does not match.
             event_id: The event ID to obtain.
+            show_redacted: Should the full content of redacted events be returned?
         Returns:
             An event, or None if there is no event matching this ID.
         Raises:
-            SynapseError if there was a problem retrieving this event, or
-            AuthError if the user does not have the rights to inspect this
-            event.
+            AuthError: if the user does not have the rights to inspect this event.
         """
-        event = await self.store.get_event(event_id, check_room_id=room_id)
+        redact_behaviour = (
+            EventRedactBehaviour.as_is if show_redacted else EventRedactBehaviour.redact
+        )
+        event = await self.store.get_event(
+            event_id,
+            check_room_id=room_id,
+            redact_behaviour=redact_behaviour,
+            allow_none=True,
+        )
 
         if not event:
             return None
 
-        users = await self.store.get_users_in_room(event.room_id)
-        is_peeking = user.to_string() not in users
+        is_user_in_room = await self.store.check_local_user_in_room(
+            user_id=user.to_string(), room_id=event.room_id
+        )
+        # The user is peeking if they aren't in the room already
+        is_peeking = not is_user_in_room
 
         filtered = await filter_events_for_client(
-            self.storage, user.to_string(), [event], is_peeking=is_peeking
+            self._storage_controllers,
+            user.to_string(),
+            [event],
+            is_peeking=is_peeking,
         )
 
         if not filtered:

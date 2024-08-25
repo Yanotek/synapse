@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # this script will use the api:
-#    https://matrix-org.github.io/synapse/latest/admin_api/purge_history_api.html
-# 
+#    https://element-hq.github.io/synapse/latest/admin_api/purge_history_api.html
+#
 # It will purge all messages in a list of rooms up to a cetrain event
 
 ###################################################################################################
@@ -77,14 +77,16 @@ TOKEN=$(sql "SELECT token FROM access_tokens WHERE user_id='$ADMIN' ORDER BY id 
 AUTH="Authorization: Bearer $TOKEN"
 
 ###################################################################################################
-# check, if your TOKEN works. For example this works: 
+# check, if your TOKEN works. For example this works:
 ###################################################################################################
-# $ curl --header "$AUTH" "$API_URL/rooms/$ROOM/state/m.room.power_levels" 
+# $ curl --header "$AUTH" "$API_URL/rooms/$ROOM/state/m.room.power_levels"
 
 ###################################################################################################
 # finally start pruning the room:
 ###################################################################################################
-POSTDATA='{"delete_local_events":"true"}' # this will really delete local events, so the messages in the room really disappear unless they are restored by remote federation
+# this will really delete local events, so the messages in the room really
+# disappear unless they are restored by remote federation. This is because
+# we pass {"delete_local_events":true} to the curl invocation below.
 
 for ROOM in "${ROOMS_ARRAY[@]}"; do
     echo "########################################### $(date) ################# "
@@ -104,7 +106,7 @@ for ROOM in "${ROOMS_ARRAY[@]}"; do
       SLEEP=2
       set -x
       # call purge
-      OUT=$(curl --header "$AUTH" -s -d $POSTDATA POST "$API_URL/admin/purge_history/$ROOM/$EVENT_ID")
+      OUT=$(curl --header "$AUTH" -s -d '{"delete_local_events":true}' POST "$API_URL/admin/purge_history/$ROOM/$EVENT_ID")
       PURGE_ID=$(echo "$OUT" |grep purge_id|cut -d'"' -f4 )
       if [ "$PURGE_ID" == "" ]; then
         # probably the history purge is already in progress for $ROOM
@@ -115,13 +117,13 @@ for ROOM in "${ROOMS_ARRAY[@]}"; do
           sleep $SLEEP
           STATUS=$(curl --header "$AUTH" -s GET "$API_URL/admin/purge_history_status/$PURGE_ID" |grep status|cut -d'"' -f4)
           : "$ROOM --> Status: $STATUS"
-          [[ "$STATUS" == "active" ]] || break 
+          [[ "$STATUS" == "active" ]] || break
           SLEEP=$((SLEEP + 1))
-        done 
+        done
       fi
       set +x
       sleep 1
-    fi  
+    fi
 done
 
 

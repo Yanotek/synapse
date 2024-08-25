@@ -1,16 +1,23 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2021 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import logging
 from typing import (
     TYPE_CHECKING,
@@ -22,11 +29,16 @@ from typing import (
     List,
     Optional,
     Set,
+    TypeVar,
     Union,
 )
 
+from typing_extensions import ParamSpec
+
+from twisted.internet.defer import CancelledError
+
 from synapse.api.presence import UserPresenceState
-from synapse.util.async_helpers import maybe_awaitable
+from synapse.util.async_helpers import delay_cancellation, maybe_awaitable
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -38,6 +50,10 @@ GET_USERS_FOR_STATES_CALLBACK = Callable[
 GET_INTERESTED_USERS_CALLBACK = Callable[[str], Awaitable[Union[Set[str], str]]]
 
 logger = logging.getLogger(__name__)
+
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def load_legacy_presence_router(hs: "HomeServer") -> None:
@@ -63,13 +79,15 @@ def load_legacy_presence_router(hs: "HomeServer") -> None:
 
     # All methods that the module provides should be async, but this wasn't enforced
     # in the old module system, so we wrap them if needed
-    def async_wrapper(f: Optional[Callable]) -> Optional[Callable[..., Awaitable]]:
+    def async_wrapper(
+        f: Optional[Callable[P, R]]
+    ) -> Optional[Callable[P, Awaitable[R]]]:
         # f might be None if the callback isn't implemented by the module. In this
         # case we don't want to register a callback at all so we return None.
         if f is None:
             return None
 
-        def run(*args: Any, **kwargs: Any) -> Awaitable:
+        def run(*args: P.args, **kwargs: P.kwargs) -> Awaitable[R]:
             # Assertion required because mypy can't prove we won't change `f`
             # back to `None`. See
             # https://mypy.readthedocs.io/en/latest/common_issues.html#narrowing-and-inner-functions
@@ -80,7 +98,7 @@ def load_legacy_presence_router(hs: "HomeServer") -> None:
         return run
 
     # Register the hooks through the module API.
-    hooks = {
+    hooks: Dict[str, Optional[Callable[..., Any]]] = {
         hook: async_wrapper(getattr(presence_router, hook, None))
         for hook in presence_router_methods
     }
@@ -147,7 +165,11 @@ class PresenceRouter:
         # run all the callbacks for get_users_for_states and combine the results
         for callback in self._get_users_for_states_callbacks:
             try:
-                result = await callback(state_updates)
+                # Note: result is an object here, because we don't trust modules to
+                # return the types they're supposed to.
+                result: object = await delay_cancellation(callback(state_updates))
+            except CancelledError:
+                raise
             except Exception as e:
                 logger.warning("Failed to run module API callback %s: %s", callback, e)
                 continue
@@ -199,7 +221,9 @@ class PresenceRouter:
         # run all the callbacks for get_interested_users and combine the results
         for callback in self._get_interested_users_callbacks:
             try:
-                result = await callback(user_id)
+                result = await delay_cancellation(callback(user_id))
+            except CancelledError:
+                raise
             except Exception as e:
                 logger.warning("Failed to run module API callback %s: %s", callback, e)
                 continue

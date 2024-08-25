@@ -1,16 +1,23 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2020 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import abc
 import logging
 import threading
@@ -28,21 +35,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-_INCONSISTENT_SEQUENCE_ERROR = """
-Postgres sequence '%(seq)s' is inconsistent with associated
-table '%(table)s'. This can happen if Synapse has been downgraded and
-then upgraded again, or due to a bad migration.
-
-To fix this error, shut down Synapse (including any and all workers)
-and run the following SQL:
-
-    SELECT setval('%(seq)s', (
-        %(max_id_sql)s
-    ));
-
-See docs/postgres.md for more information.
-"""
 
 _INCONSISTENT_STREAM_ERROR = """
 Postgres sequence '%(seq)s' is inconsistent with associated stream position
@@ -95,6 +87,10 @@ class SequenceGenerator(metaclass=abc.ABCMeta):
         somewhere (e.g. two ID generators have the same stream name).
         """
         ...
+
+    @abc.abstractmethod
+    def get_max_allocated(self, txn: Cursor) -> int:
+        """Get the maximum ID that we have allocated"""
 
 
 class PostgresSequenceGenerator(SequenceGenerator):
@@ -162,25 +158,33 @@ class PostgresSequenceGenerator(SequenceGenerator):
             if row:
                 max_in_stream_positions = row[0]
 
-        txn.close()
-
         # If `is_called` is False then `last_value` is actually the value that
         # will be generated next, so we decrement to get the true "last value".
         if not is_called:
             last_value -= 1
 
         if max_stream_id > last_value:
+            # The sequence is lagging behind the tables. This is probably due to
+            # rolling back to a version before the sequence was used and then
+            # forwards again. We resolve this by setting the sequence to the
+            # right value.
             logger.warning(
-                "Postgres sequence %s is behind table %s: %d < %d",
+                "Postgres sequence %s is behind table %s: %d < %d. Updating sequence.",
                 self._sequence_name,
                 table,
                 last_value,
                 max_stream_id,
             )
-            raise IncorrectDatabaseSetup(
-                _INCONSISTENT_SEQUENCE_ERROR
-                % {"seq": self._sequence_name, "table": table, "max_id_sql": table_sql}
-            )
+
+            sql = f"""
+                SELECT setval('{self._sequence_name}', GREATEST(
+                    (SELECT last_value FROM {self._sequence_name}),
+                    ({table_sql})
+                ));
+            """
+            txn.execute(sql)
+
+        txn.close()
 
         # If we have values in the stream positions table then they have to be
         # less than or equal to `last_value`
@@ -189,6 +193,17 @@ class PostgresSequenceGenerator(SequenceGenerator):
                 _INCONSISTENT_STREAM_ERROR
                 % {"seq": self._sequence_name, "stream_name": stream_name}
             )
+
+    def get_max_allocated(self, txn: Cursor) -> int:
+        # We just read from the sequence what the last value we fetched was.
+        txn.execute(f"SELECT last_value, is_called FROM {self._sequence_name}")
+        row = txn.fetchone()
+        assert row is not None
+
+        last_value, is_called = row
+        if not is_called:
+            last_value -= 1
+        return last_value
 
 
 GetFirstCallbackType = Callable[[Cursor], int]
@@ -205,7 +220,7 @@ class LocalSequenceGenerator(SequenceGenerator):
         """
         Args:
             get_first_callback: a callback which is called on the first call to
-                 get_next_id_txn; should return the curreent maximum id
+                 get_next_id_txn; should return the current maximum id
         """
         # the callback. this is cleared after it is called, so that it can be GCed.
         self._callback: Optional[GetFirstCallbackType] = get_first_callback
@@ -247,6 +262,15 @@ class LocalSequenceGenerator(SequenceGenerator):
     ) -> None:
         # There is nothing to do for in memory sequences
         pass
+
+    def get_max_allocated(self, txn: Cursor) -> int:
+        with self._lock:
+            if self._current_max_id is None:
+                assert self._callback is not None
+                self._current_max_id = self._callback(txn)
+                self._callback = None
+
+            return self._current_max_id
 
 
 def build_sequence_generator(

@@ -1,39 +1,55 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import contextlib
 import logging
 import time
-from typing import Generator, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Generator, Optional, Tuple, Union
 
 import attr
 from zope.interface import implementer
 
-from twisted.internet.interfaces import IAddress, IReactorTime
+from twisted.internet.address import UNIXAddress
+from twisted.internet.defer import Deferred
+from twisted.internet.interfaces import IAddress
 from twisted.python.failure import Failure
 from twisted.web.http import HTTPChannel
 from twisted.web.resource import IResource, Resource
-from twisted.web.server import Request, Site
+from twisted.web.server import Request
 
 from synapse.config.server import ListenerConfig
 from synapse.http import get_request_user_agent, redact_uri
+from synapse.http.proxy import ProxySite
 from synapse.http.request_metrics import RequestMetrics, requests_counter
 from synapse.logging.context import (
     ContextRequest,
     LoggingContext,
     PreserveLoggingContext,
 )
-from synapse.types import Requester
+from synapse.types import ISynapseReactor, Requester
+
+if TYPE_CHECKING:
+    import opentracing
+
+    from synapse.server import HomeServer
+
 
 logger = logging.getLogger(__name__)
 
@@ -66,23 +82,38 @@ class SynapseRequest(Request):
         self,
         channel: HTTPChannel,
         site: "SynapseSite",
-        *args,
+        *args: Any,
         max_request_body_size: int = 1024,
-        **kw,
+        request_id_header: Optional[str] = None,
+        **kw: Any,
     ):
         super().__init__(channel, *args, **kw)
         self._max_request_body_size = max_request_body_size
+        self.request_id_header = request_id_header
         self.synapse_site = site
         self.reactor = site.reactor
         self._channel = channel  # this is used by the tests
         self.start_time = 0.0
+        self.experimental_cors_msc3886 = site.experimental_cors_msc3886
 
         # The requester, if authenticated. For federation requests this is the
         # server name, for client requests this is the Requester object.
         self._requester: Optional[Union[Requester, str]] = None
 
+        # An opentracing span for this request. Will be closed when the request is
+        # completely processed.
+        self._opentracing_span: "Optional[opentracing.Span]" = None
+
         # we can't yet create the logcontext, as we don't know the method.
         self.logcontext: Optional[LoggingContext] = None
+
+        # The `Deferred` to cancel if the client disconnects early and
+        # `is_render_cancellable` is set. Expected to be set by `Resource.render`.
+        self.render_deferred: Optional["Deferred[None]"] = None
+        # A boolean indicating whether `render_deferred` should be cancelled if the
+        # client disconnects early. Expected to be set by the coroutine started by
+        # `Resource.render`, if rendering is asynchronous.
+        self.is_render_cancellable: bool = False
 
         global _next_request_seq
         self.request_seq = _next_request_seq
@@ -119,7 +150,8 @@ class SynapseRequest(Request):
                 self.get_method(),
                 self.get_redacted_uri(),
             )
-            self.transport.abortConnection()
+            if self.channel:
+                self.channel.forceAbortClient()
             return
         super().handleContentChunk(data)
 
@@ -148,8 +180,22 @@ class SynapseRequest(Request):
         # If there's no authenticated entity, it was the requester.
         self.logcontext.request.authenticated_entity = authenticated_entity or requester
 
+    def set_opentracing_span(self, span: "opentracing.Span") -> None:
+        """attach an opentracing span to this request
+
+        Doing so will cause the span to be closed when we finish processing the request
+        """
+        self._opentracing_span = span
+
     def get_request_id(self) -> str:
-        return "%s-%i" % (self.get_method(), self.request_seq)
+        request_id_value = None
+        if self.request_id_header:
+            request_id_value = self.getHeader(self.request_id_header)
+
+        if request_id_value is None:
+            request_id_value = str(self.request_seq)
+
+        return "%s-%s" % (self.get_method(), request_id_value)
 
     def get_redacted_uri(self) -> str:
         """Gets the redacted URI associated with the request (or placeholder if the URI
@@ -203,7 +249,7 @@ class SynapseRequest(Request):
 
             # If this is a request where the target user doesn't match the user who
             # authenticated (e.g. and admin is puppetting a user) then we return both.
-            if self._requester.user.to_string() != authenticated_entity:
+            if requester != authenticated_entity:
                 return requester, authenticated_entity
 
             return requester, None
@@ -224,7 +270,7 @@ class SynapseRequest(Request):
             request_id,
             request=ContextRequest(
                 request_id=request_id,
-                ip_address=self.getClientIP(),
+                ip_address=self.get_client_ip_if_available(),
                 site_tag=self.synapse_site.site_tag,
                 # The requester is going to be unknown at this point.
                 requester=None,
@@ -286,6 +332,9 @@ class SynapseRequest(Request):
             self._processing_finished_time = time.time()
             self._is_processing = False
 
+            if self._opentracing_span:
+                self._opentracing_span.log_kv({"event": "finished processing"})
+
             # if we've already sent the response, log it now; otherwise, we wait for the
             # response to be sent.
             if self.finish_time is not None:
@@ -299,6 +348,8 @@ class SynapseRequest(Request):
         """
         self.finish_time = time.time()
         Request.finish(self)
+        if self._opentracing_span:
+            self._opentracing_span.log_kv({"event": "response sent"})
         if not self._is_processing:
             assert self.logcontext is not None
             with PreserveLoggingContext(self.logcontext):
@@ -333,7 +384,26 @@ class SynapseRequest(Request):
         with PreserveLoggingContext(self.logcontext):
             logger.info("Connection from client lost before response was sent")
 
-            if not self._is_processing:
+            if self._opentracing_span:
+                self._opentracing_span.log_kv(
+                    {"event": "client connection lost", "reason": str(reason.value)}
+                )
+
+            if self._is_processing:
+                if self.is_render_cancellable:
+                    if self.render_deferred is not None:
+                        # Throw a cancellation into the request processing, in the hope
+                        # that it will finish up sooner than it normally would.
+                        # The `self.processing()` context manager will call
+                        # `_finished_processing()` when done.
+                        with PreserveLoggingContext():
+                            self.render_deferred.cancel()
+                    else:
+                        logger.error(
+                            "Connection from client lost, but have no Deferred to "
+                            "cancel even though the request is marked as cancellable."
+                        )
+            else:
                 self._finished_processing()
 
     def _started_processing(self, servlet_name: str) -> None:
@@ -343,7 +413,7 @@ class SynapseRequest(Request):
         be sure to call finished_processing.
 
         Args:
-            servlet_name (str): the name of the servlet which will be
+            servlet_name: the name of the servlet which will be
                 processing this request. This is used in the metrics.
 
                 It is possible to update this afterwards by updating
@@ -357,7 +427,7 @@ class SynapseRequest(Request):
 
         self.synapse_site.access_logger.debug(
             "%s - %s - Received request: %s %s",
-            self.getClientIP(),
+            self.get_client_ip_if_available(),
             self.synapse_site.site_tag,
             self.get_method(),
             self.get_redacted_uri(),
@@ -383,7 +453,10 @@ class SynapseRequest(Request):
 
         user_agent = get_request_user_agent(self, "-")
 
-        code = str(self.code)
+        # int(self.code) looks redundant, because self.code is already an int.
+        # But self.code might be an HTTPStatus (which inherits from int)---which has
+        # a different string representation. So ensure we really have an integer.
+        code = str(int(self.code))
         if not self.finished:
             # we didn't send the full response before we gave up (presumably because
             # the connection dropped)
@@ -402,7 +475,7 @@ class SynapseRequest(Request):
             "%s - %s - {%s}"
             " Processed request: %.3fsec/%.3fsec (%.3fsec, %.3fsec) (%.3fsec/%.3fsec/%d)"
             ' %sB %s "%s %s %s" "%s" [%d dbevts]',
-            self.getClientIP(),
+            self.get_client_ip_if_available(),
             self.synapse_site.site_tag,
             requester,
             processing_time,
@@ -421,6 +494,10 @@ class SynapseRequest(Request):
             usage.evt_db_fetch_count,
         )
 
+        # complete the opentracing span, if any.
+        if self._opentracing_span:
+            self._opentracing_span.finish()
+
         try:
             self.request_metrics.stop(self.finish_time, self.code, self.sentLength)
         except Exception as e:
@@ -435,6 +512,31 @@ class SynapseRequest(Request):
             return False
 
         return True
+
+    def get_client_ip_if_available(self) -> str:
+        """Logging helper. Return something useful when a client IP is not retrievable
+        from a unix socket.
+
+        In practice, this returns the socket file path on a SynapseRequest if using a
+        unix socket and the normal IP address for TCP sockets.
+
+        """
+        # getClientAddress().host returns a proper IP address for a TCP socket. But
+        # unix sockets have no concept of IP addresses or ports and return a
+        # UNIXAddress containing a 'None' value. In order to get something usable for
+        # logs(where this is used) get the unix socket file. getHost() returns a
+        # UNIXAddress containing a value of the socket file and has an instance
+        # variable of 'name' encoded as a byte string containing the path we want.
+        # Decode to utf-8 so it looks nice.
+        if isinstance(self.getClientAddress(), UNIXAddress):
+            return self.getHost().name.decode("utf-8")
+        else:
+            return self.getClientAddress().host
+
+    def request_info(self) -> "RequestInfo":
+        h = self.getHeader(b"User-Agent")
+        user_agent = h.decode("ascii", "replace") if h else None
+        return RequestInfo(user_agent=user_agent, ip=self.get_client_ip_if_available())
 
 
 class XForwardedForRequest(SynapseRequest):
@@ -506,12 +608,12 @@ class XForwardedForRequest(SynapseRequest):
 
 
 @implementer(IAddress)
-@attr.s(frozen=True, slots=True)
+@attr.s(frozen=True, slots=True, auto_attribs=True)
 class _XForwardedForAddress:
-    host = attr.ib(type=str)
+    host: str
 
 
-class SynapseSite(Site):
+class SynapseSite(ProxySite):
     """
     Synapse-specific twisted http Site
 
@@ -533,7 +635,8 @@ class SynapseSite(Site):
         resource: IResource,
         server_version_string: str,
         max_request_body_size: int,
-        reactor: IReactorTime,
+        reactor: ISynapseReactor,
+        hs: "HomeServer",
     ):
         """
 
@@ -548,26 +651,43 @@ class SynapseSite(Site):
                 dropping the connection
             reactor: reactor to be used to manage connection timeouts
         """
-        Site.__init__(self, resource, reactor=reactor)
+        super().__init__(
+            resource=resource,
+            reactor=reactor,
+            hs=hs,
+        )
 
         self.site_tag = site_tag
-        self.reactor = reactor
+        self.reactor: ISynapseReactor = reactor
 
         assert config.http_options is not None
         proxied = config.http_options.x_forwarded
         request_class = XForwardedForRequest if proxied else SynapseRequest
 
-        def request_factory(channel, queued: bool) -> Request:
+        request_id_header = config.http_options.request_id_header
+
+        self.experimental_cors_msc3886: bool = (
+            config.http_options.experimental_cors_msc3886
+        )
+
+        def request_factory(channel: HTTPChannel, queued: bool) -> Request:
             return request_class(
                 channel,
                 self,
                 max_request_body_size=max_request_body_size,
                 queued=queued,
+                request_id_header=request_id_header,
             )
 
         self.requestFactory = request_factory  # type: ignore
         self.access_logger = logging.getLogger(logger_name)
         self.server_version_string = server_version_string.encode("ascii")
 
-    def log(self, request: SynapseRequest) -> None:
+    def log(self, request: SynapseRequest) -> None:  # type: ignore[override]
         pass
+
+
+@attr.s(auto_attribs=True, frozen=True, slots=True)
+class RequestInfo:
+    user_agent: Optional[str]
+    ip: str

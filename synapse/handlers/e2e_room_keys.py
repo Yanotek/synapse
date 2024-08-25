@@ -1,20 +1,28 @@
-# Copyright 2017, 2018 New Vector Ltd
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2019 Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, Optional, cast
+
+from typing_extensions import Literal
 
 from synapse.api.errors import (
     Codes,
@@ -24,8 +32,9 @@ from synapse.api.errors import (
     SynapseError,
 )
 from synapse.logging.opentracing import log_kv, trace
+from synapse.storage.databases.main.e2e_room_keys import RoomKey
 from synapse.types import JsonDict
-from synapse.util.async_helpers import Linearizer
+from synapse.util.async_helpers import ReadWriteLock
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -42,14 +51,14 @@ class E2eRoomKeysHandler:
     """
 
     def __init__(self, hs: "HomeServer"):
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
 
         # Used to lock whenever a client is uploading key data.  This prevents collisions
         # between clients trying to upload the details of a new session, given all
         # clients belonging to a user will receive and try to upload a new session at
         # roughly the same time.  Also used to lock out uploads when the key is being
         # changed.
-        self._upload_linearizer = Linearizer("upload_room_keys_lock")
+        self._upload_lock = ReadWriteLock()
 
     @trace
     async def get_room_keys(
@@ -58,7 +67,9 @@ class E2eRoomKeysHandler:
         version: str,
         room_id: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> List[JsonDict]:
+    ) -> Dict[
+        Literal["rooms"], Dict[str, Dict[Literal["sessions"], Dict[str, RoomKey]]]
+    ]:
         """Bulk get the E2E room keys for a given backup, optionally filtered to a given
         room, or a given session.
         See EndToEndRoomKeyStore.get_e2e_room_keys for full details.
@@ -72,13 +83,13 @@ class E2eRoomKeysHandler:
         Raises:
             NotFoundError: if the backup version does not exist
         Returns:
-            A list of dicts giving the session_data and message metadata for
-            these room keys.
+            A dict giving the session_data and message metadata for these room keys.
+            `{"rooms": {room_id: {"sessions": {session_id: room_key}}}}`
         """
 
         # we deliberately take the lock to get keys so that changing the version
         # works atomically
-        with (await self._upload_linearizer.queue(user_id)):
+        async with self._upload_lock.read(user_id):
             # make sure the backup version exists
             try:
                 await self.store.get_e2e_room_keys_version_info(user_id, version)
@@ -92,7 +103,7 @@ class E2eRoomKeysHandler:
                 user_id, version, room_id, session_id
             )
 
-            log_kv(results)
+            log_kv(cast(JsonDict, results))
             return results
 
     @trace
@@ -121,7 +132,7 @@ class E2eRoomKeysHandler:
         """
 
         # lock for consistency with uploading
-        with (await self._upload_linearizer.queue(user_id)):
+        async with self._upload_lock.write(user_id):
             # make sure the backup version exists
             try:
                 version_info = await self.store.get_e2e_room_keys_version_info(
@@ -182,8 +193,7 @@ class E2eRoomKeysHandler:
         # TODO: Validate the JSON to make sure it has the right keys.
 
         # XXX: perhaps we should use a finer grained lock here?
-        with (await self._upload_linearizer.queue(user_id)):
-
+        async with self._upload_lock.write(user_id):
             # Check that the version we're trying to upload is the current version
             try:
                 version_info = await self.store.get_e2e_room_keys_version_info(user_id)
@@ -237,6 +247,12 @@ class E2eRoomKeysHandler:
                     if current_room_key:
                         if self._should_replace_room_key(current_room_key, room_key):
                             log_kv({"message": "Replacing room key."})
+                            logger.debug(
+                                "Replacing room key. room=%s session=%s user=%s",
+                                room_id,
+                                session_id,
+                                user_id,
+                            )
                             # updates are done one at a time in the DB, so send
                             # updates right away rather than batching them up,
                             # like we do with the inserts
@@ -246,6 +262,12 @@ class E2eRoomKeysHandler:
                             changed = True
                         else:
                             log_kv({"message": "Not replacing room_key."})
+                            logger.debug(
+                                "Not replacing room key. room=%s session=%s user=%s",
+                                room_id,
+                                session_id,
+                                user_id,
+                            )
                     else:
                         log_kv(
                             {
@@ -255,6 +277,12 @@ class E2eRoomKeysHandler:
                             }
                         )
                         log_kv({"message": "Replacing room key."})
+                        logger.debug(
+                            "Inserting new room key. room=%s session=%s user=%s",
+                            room_id,
+                            session_id,
+                            user_id,
+                        )
                         to_insert.append((room_id, session_id, room_key))
                         changed = True
 
@@ -273,7 +301,7 @@ class E2eRoomKeysHandler:
 
     @staticmethod
     def _should_replace_room_key(
-        current_room_key: Optional[JsonDict], room_key: JsonDict
+        current_room_key: Optional[RoomKey], room_key: RoomKey
     ) -> bool:
         """
         Determine whether to replace a given current_room_key (if any)
@@ -327,7 +355,7 @@ class E2eRoomKeysHandler:
         # TODO: Validate the JSON to make sure it has the right keys.
 
         # lock everyone out until we've switched version
-        with (await self._upload_linearizer.queue(user_id)):
+        async with self._upload_lock.write(user_id):
             new_version = await self.store.create_e2e_room_keys_version(
                 user_id, version_info
             )
@@ -354,7 +382,7 @@ class E2eRoomKeysHandler:
         }
         """
 
-        with (await self._upload_linearizer.queue(user_id)):
+        async with self._upload_lock.read(user_id):
             try:
                 res = await self.store.get_e2e_room_keys_version_info(user_id, version)
             except StoreError as e:
@@ -372,13 +400,14 @@ class E2eRoomKeysHandler:
         """Deletes a given version of the user's e2e_room_keys backup
 
         Args:
-            user_id(str): the user whose current backup version we're deleting
-            version(str): the version id of the backup being deleted
+            user_id: the user whose current backup version we're deleting
+            version: Optional. the version ID of the backup version we're deleting
+                If missing, we delete the current backup version info.
         Raises:
             NotFoundError: if this backup version doesn't exist
         """
 
-        with (await self._upload_linearizer.queue(user_id)):
+        async with self._upload_lock.write(user_id):
             try:
                 await self.store.delete_e2e_room_keys_version(user_id, version)
             except StoreError as e:
@@ -408,7 +437,7 @@ class E2eRoomKeysHandler:
             raise SynapseError(
                 400, "Version in body does not match", Codes.INVALID_PARAM
             )
-        with (await self._upload_linearizer.queue(user_id)):
+        async with self._upload_lock.write(user_id):
             try:
                 old_info = await self.store.get_e2e_room_keys_version_info(
                     user_id, version

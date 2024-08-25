@@ -1,64 +1,56 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2021 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import ctypes
 import logging
 import os
 import re
-from typing import Optional
+from typing import Iterable, Optional, overload
 
-from synapse.metrics import REGISTRY, GaugeMetricFamily
+import attr
+from prometheus_client import REGISTRY, Metric
+from typing_extensions import Literal
+
+from synapse.metrics import GaugeMetricFamily
+from synapse.metrics._types import Collector
 
 logger = logging.getLogger(__name__)
 
 
-def _setup_jemalloc_stats():
-    """Checks to see if jemalloc is loaded, and hooks up a collector to record
-    statistics exposed by jemalloc.
-    """
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class JemallocStats:
+    jemalloc: ctypes.CDLL
 
-    # Try to find the loaded jemalloc shared library, if any. We need to
-    # introspect into what is loaded, rather than loading whatever is on the
-    # path, as if we load a *different* jemalloc version things will seg fault.
+    @overload
+    def _mallctl(
+        self, name: str, read: Literal[True] = True, write: Optional[int] = None
+    ) -> int: ...
 
-    # We look in `/proc/self/maps`, which only exists on linux.
-    if not os.path.exists("/proc/self/maps"):
-        logger.debug("Not looking for jemalloc as no /proc/self/maps exist")
-        return
-
-    # We're looking for a path at the end of the line that includes
-    # "libjemalloc".
-    regex = re.compile(r"/\S+/libjemalloc.*$")
-
-    jemalloc_path = None
-    with open("/proc/self/maps") as f:
-        for line in f:
-            match = regex.search(line.strip())
-            if match:
-                jemalloc_path = match.group()
-
-    if not jemalloc_path:
-        # No loaded jemalloc was found.
-        logger.debug("jemalloc not found")
-        return
-
-    logger.debug("Found jemalloc at %s", jemalloc_path)
-
-    jemalloc = ctypes.CDLL(jemalloc_path)
+    @overload
+    def _mallctl(
+        self, name: str, read: Literal[False], write: Optional[int] = None
+    ) -> None: ...
 
     def _mallctl(
-        name: str, read: bool = True, write: Optional[int] = None
+        self, name: str, read: bool = True, write: Optional[int] = None
     ) -> Optional[int]:
         """Wrapper around `mallctl` for reading and writing integers to
         jemalloc.
@@ -106,7 +98,7 @@ def _setup_jemalloc_stats():
         # Where oldp/oldlenp is a buffer where the old value will be written to
         # (if not null), and newp/newlen is the buffer with the new value to set
         # (if not null). Note that they're all references *except* newlen.
-        result = jemalloc.mallctl(
+        result = self.jemalloc.mallctl(
             name.encode("ascii"),
             input_var_ref,
             input_len_ref,
@@ -122,21 +114,80 @@ def _setup_jemalloc_stats():
 
         return input_var.value
 
-    def _jemalloc_refresh_stats() -> None:
+    def refresh_stats(self) -> None:
         """Request that jemalloc updates its internal statistics. This needs to
         be called before querying for stats, otherwise it will return stale
         values.
         """
         try:
-            _mallctl("epoch", read=False, write=1)
+            self._mallctl("epoch", read=False, write=1)
         except Exception as e:
             logger.warning("Failed to reload jemalloc stats: %s", e)
 
-    class JemallocCollector:
+    def get_stat(self, name: str) -> int:
+        """Request the stat of the given name at the time of the last
+        `refresh_stats` call. This may throw if we fail to read
+        the stat.
+        """
+        return self._mallctl(f"stats.{name}")
+
+
+_JEMALLOC_STATS: Optional[JemallocStats] = None
+
+
+def get_jemalloc_stats() -> Optional[JemallocStats]:
+    """Returns an interface to jemalloc, if it is being used.
+
+    Note that this will always return None until `setup_jemalloc_stats` has been
+    called.
+    """
+    return _JEMALLOC_STATS
+
+
+def _setup_jemalloc_stats() -> None:
+    """Checks to see if jemalloc is loaded, and hooks up a collector to record
+    statistics exposed by jemalloc.
+    """
+
+    global _JEMALLOC_STATS
+
+    # Try to find the loaded jemalloc shared library, if any. We need to
+    # introspect into what is loaded, rather than loading whatever is on the
+    # path, as if we load a *different* jemalloc version things will seg fault.
+
+    # We look in `/proc/self/maps`, which only exists on linux.
+    if not os.path.exists("/proc/self/maps"):
+        logger.debug("Not looking for jemalloc as no /proc/self/maps exist")
+        return
+
+    # We're looking for a path at the end of the line that includes
+    # "libjemalloc".
+    regex = re.compile(r"/\S+/libjemalloc.*$")
+
+    jemalloc_path = None
+    with open("/proc/self/maps") as f:
+        for line in f:
+            match = regex.search(line.strip())
+            if match:
+                jemalloc_path = match.group()
+
+    if not jemalloc_path:
+        # No loaded jemalloc was found.
+        logger.debug("jemalloc not found")
+        return
+
+    logger.debug("Found jemalloc at %s", jemalloc_path)
+
+    jemalloc_dll = ctypes.CDLL(jemalloc_path)
+
+    stats = JemallocStats(jemalloc_dll)
+    _JEMALLOC_STATS = stats
+
+    class JemallocCollector(Collector):
         """Metrics for internal jemalloc stats."""
 
-        def collect(self):
-            _jemalloc_refresh_stats()
+        def collect(self) -> Iterable[Metric]:
+            stats.refresh_stats()
 
             g = GaugeMetricFamily(
                 "jemalloc_stats_app_memory_bytes",
@@ -170,7 +221,7 @@ def _setup_jemalloc_stats():
                 "metadata",
             ):
                 try:
-                    value = _mallctl(f"stats.{t}")
+                    value = stats.get_stat(t)
                 except Exception as e:
                     # There was an error fetching the value, skip.
                     logger.warning("Failed to read jemalloc stats.%s: %s", t, e)
@@ -185,7 +236,7 @@ def _setup_jemalloc_stats():
     logger.debug("Added jemalloc stats")
 
 
-def setup_jemalloc_stats():
+def setup_jemalloc_stats() -> None:
     """Try to setup jemalloc stats, if jemalloc is loaded."""
 
     try:
