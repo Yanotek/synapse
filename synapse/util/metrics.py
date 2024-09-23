@@ -1,24 +1,31 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
 from functools import wraps
 from types import TracebackType
-from typing import Any, Callable, Optional, Type, TypeVar, cast
+from typing import Awaitable, Callable, Dict, Generator, Optional, Type, TypeVar
 
-from prometheus_client import Counter
-from typing_extensions import Protocol
+from prometheus_client import CollectorRegistry, Counter, Metric
+from typing_extensions import Concatenate, ParamSpec, Protocol
 
 from synapse.logging.context import (
     ContextResourceUsage,
@@ -56,24 +63,37 @@ block_db_sched_duration = Counter(
     "synapse_util_metrics_block_db_sched_duration_seconds", "", ["block_name"]
 )
 
+
+# This is dynamically created in InFlightGauge.__init__.
+class _InFlightMetric(Protocol):
+    real_time_max: float
+    real_time_sum: float
+
+
 # Tracks the number of blocks currently active
-in_flight = InFlightGauge(
+in_flight: InFlightGauge[_InFlightMetric] = InFlightGauge(
     "synapse_util_metrics_block_in_flight",
     "",
     labels=["block_name"],
     sub_metrics=["real_time_max", "real_time_sum"],
 )
 
-T = TypeVar("T", bound=Callable[..., Any])
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 class HasClock(Protocol):
     clock: Clock
 
 
-def measure_func(name: Optional[str] = None) -> Callable[[T], T]:
-    """
-    Used to decorate an async function with a `Measure` context manager.
+def measure_func(
+    name: Optional[str] = None,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Decorate an async method with a `Measure` context manager.
+
+    The Measure is created using `self.clock`; it should only be used to decorate
+    methods in classes defining an instance-level `clock` attribute.
 
     Usage:
 
@@ -89,18 +109,24 @@ def measure_func(name: Optional[str] = None) -> Callable[[T], T]:
 
     """
 
-    def wrapper(func: T) -> T:
+    def wrapper(
+        func: Callable[Concatenate[HasClock, P], Awaitable[R]]
+    ) -> Callable[P, Awaitable[R]]:
         block_name = func.__name__ if name is None else name
 
         @wraps(func)
-        async def measured_func(self: HasClock, *args: Any, **kwargs: Any) -> Any:
+        async def measured_func(self: HasClock, *args: P.args, **kwargs: P.kwargs) -> R:
             with Measure(self.clock, block_name):
                 r = await func(self, *args, **kwargs)
             return r
 
-        return cast(T, measured_func)
+        # There are some shenanigans here, because we're decorating a method but
+        # explicitly making use of the `self` parameter. The key thing here is that the
+        # return type within the return type for `measure_func` itself describes how the
+        # decorated function will be called.
+        return measured_func  # type: ignore[return-value]
 
-    return wrapper
+    return wrapper  # type: ignore[return-value]
 
 
 class Measure:
@@ -180,7 +206,7 @@ class Measure:
         """
         return self._logging_context.get_resource_usage()
 
-    def _update_in_flight(self, metrics) -> None:
+    def _update_in_flight(self, metrics: _InFlightMetric) -> None:
         """Gets called when processing in flight metrics"""
         assert self.start is not None
         duration = self.clock.time() - self.start
@@ -189,3 +215,33 @@ class Measure:
         metrics.real_time_sum += duration
 
         # TODO: Add other in flight metrics.
+
+
+class DynamicCollectorRegistry(CollectorRegistry):
+    """
+    Custom Prometheus Collector registry that calls a hook first, allowing you
+    to update metrics on-demand.
+
+    Don't forget to register this registry with the main registry!
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pre_update_hooks: Dict[str, Callable[[], None]] = {}
+
+    def collect(self) -> Generator[Metric, None, None]:
+        """
+        Collects metrics, calling pre-update hooks first.
+        """
+
+        for pre_update_hook in self._pre_update_hooks.values():
+            pre_update_hook()
+
+        yield from super().collect()
+
+    def register_hook(self, metric_name: str, hook: Callable[[], None]) -> None:
+        """
+        Registers a hook that is called before metric collection.
+        """
+
+        self._pre_update_hooks[metric_name] = hook

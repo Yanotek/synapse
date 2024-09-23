@@ -1,16 +1,27 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2014-2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
+
+from typing import Any
+
+from synapse.types import JsonDict
 
 from ._base import Config
 
@@ -18,7 +29,7 @@ from ._base import Config
 class VoipConfig(Config):
     section = "voip"
 
-    def read_config(self, config, **kwargs):
+    def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         self.turn_uris = config.get("turn_uris", [])
         self.turn_shared_secret = config.get("turn_shared_secret")
         self.turn_username = config.get("turn_username")
@@ -27,34 +38,3 @@ class VoipConfig(Config):
             config.get("turn_user_lifetime", "1h")
         )
         self.turn_allow_guests = config.get("turn_allow_guests", True)
-
-    def generate_config_section(self, **kwargs):
-        return """\
-        ## TURN ##
-
-        # The public URIs of the TURN server to give to clients
-        #
-        #turn_uris: []
-
-        # The shared secret used to compute passwords for the TURN server
-        #
-        #turn_shared_secret: "YOUR_SHARED_SECRET"
-
-        # The Username and password if the TURN server needs them and
-        # does not use a token
-        #
-        #turn_username: "TURNSERVER_USERNAME"
-        #turn_password: "TURNSERVER_PASSWORD"
-
-        # How long generated TURN credentials last
-        #
-        #turn_user_lifetime: 1h
-
-        # Whether guests should be allowed to use the TURN server.
-        # This defaults to True, otherwise VoIP will be unreliable for guests.
-        # However, it does introduce a slight security risk as it allows users to
-        # connect to arbitrary endpoints without having first signed up for a
-        # valid account (e.g. by passing a CAPTCHA).
-        #
-        #turn_allow_guests: true
-        """

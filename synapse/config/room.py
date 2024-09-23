@@ -1,20 +1,29 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2020 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
+from typing import Any
 
 from synapse.api.constants import RoomCreationPreset
+from synapse.types import JsonDict
 
 from ._base import Config, ConfigError
 
@@ -32,7 +41,7 @@ class RoomDefaultEncryptionTypes:
 class RoomConfig(Config):
     section = "room"
 
-    def read_config(self, config, **kwargs):
+    def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         # Whether new, locally-created rooms should have encryption enabled
         encryption_for_room_type = config.get(
             "encryption_enabled_by_default_for_room_type",
@@ -61,24 +70,19 @@ class RoomConfig(Config):
                 "Invalid value for encryption_enabled_by_default_for_room_type"
             )
 
-    def generate_config_section(self, **kwargs):
-        return """\
-        ## Rooms ##
+        self.default_power_level_content_override = config.get(
+            "default_power_level_content_override",
+            None,
+        )
+        if self.default_power_level_content_override is not None:
+            for preset in self.default_power_level_content_override:
+                if preset not in vars(RoomCreationPreset).values():
+                    raise ConfigError(
+                        "Unrecognised room preset %s in default_power_level_content_override"
+                        % preset
+                    )
+                # We validate the actual overrides when we try to apply them.
 
-        # Controls whether locally-created rooms should be end-to-end encrypted by
-        # default.
-        #
-        # Possible options are "all", "invite", and "off". They are defined as:
-        #
-        # * "all": any locally-created room
-        # * "invite": any room created with the "private_chat" or "trusted_private_chat"
-        #             room creation presets
-        # * "off": this option will take no effect
-        #
-        # The default value is "off".
-        #
-        # Note that this option will only affect rooms created after it is set. It
-        # will also not affect rooms created by other servers.
-        #
-        #encryption_enabled_by_default_for_room_type: invite
-        """
+        # When enabled, users will forget rooms when they leave them, either via a
+        # leave, kick or ban.
+        self.forget_on_leave = config.get("forget_rooms_on_leave", False)

@@ -1,24 +1,33 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2014-2016 OpenMarket Ltd
-# Copyright 2018 New Vector
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 """Tests REST events for /rooms paths."""
 
-from unittest.mock import Mock
+from twisted.test.proto_helpers import MemoryReactor
 
+from synapse.api.constants import EduTypes
 from synapse.rest.client import room
+from synapse.server import HomeServer
 from synapse.types import UserID
+from synapse.util import Clock
 
 from tests import unittest
 
@@ -33,95 +42,73 @@ class RoomTypingTestCase(unittest.HomeserverTestCase):
     user = UserID.from_string(user_id)
     servlets = [room.register_servlets]
 
-    def make_homeserver(self, reactor, clock):
-
-        hs = self.setup_test_homeserver(
-            "red",
-            federation_http_client=None,
-            federation_client=Mock(),
-        )
-
+    def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
+        hs = self.setup_test_homeserver("red")
         self.event_source = hs.get_event_sources().sources.typing
-
-        hs.get_federation_handler = Mock()
-
-        async def get_user_by_access_token(token=None, allow_guest=False):
-            return {
-                "user": UserID.from_string(self.auth_user_id),
-                "token_id": 1,
-                "is_guest": False,
-            }
-
-        hs.get_auth().get_user_by_access_token = get_user_by_access_token
-
-        async def _insert_client_ip(*args, **kwargs):
-            return None
-
-        hs.get_datastore().insert_client_ip = _insert_client_ip
-
         return hs
 
-    def prepare(self, reactor, clock, hs):
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.room_id = self.helper.create_room_as(self.user_id)
         # Need another user to make notifications actually work
         self.helper.join(self.room_id, user="@jim:red")
 
-    def test_set_typing(self):
+    def test_set_typing(self) -> None:
         channel = self.make_request(
             "PUT",
             "/rooms/%s/typing/%s" % (self.room_id, self.user_id),
             b'{"typing": true, "timeout": 30000}',
         )
-        self.assertEquals(200, channel.code)
+        self.assertEqual(200, channel.code)
 
-        self.assertEquals(self.event_source.get_current_key(), 1)
+        self.assertEqual(self.event_source.get_current_key(), 1)
         events = self.get_success(
             self.event_source.get_new_events(
                 user=UserID.from_string(self.user_id),
                 from_key=0,
-                limit=None,
+                # Limit is unused.
+                limit=0,
                 room_ids=[self.room_id],
                 is_guest=False,
             )
         )
-        self.assertEquals(
+        self.assertEqual(
             events[0],
             [
                 {
-                    "type": "m.typing",
+                    "type": EduTypes.TYPING,
                     "room_id": self.room_id,
                     "content": {"user_ids": [self.user_id]},
                 }
             ],
         )
 
-    def test_set_not_typing(self):
+    def test_set_not_typing(self) -> None:
         channel = self.make_request(
             "PUT",
             "/rooms/%s/typing/%s" % (self.room_id, self.user_id),
             b'{"typing": false}',
         )
-        self.assertEquals(200, channel.code)
+        self.assertEqual(200, channel.code)
 
-    def test_typing_timeout(self):
+    def test_typing_timeout(self) -> None:
         channel = self.make_request(
             "PUT",
             "/rooms/%s/typing/%s" % (self.room_id, self.user_id),
             b'{"typing": true, "timeout": 30000}',
         )
-        self.assertEquals(200, channel.code)
+        self.assertEqual(200, channel.code)
 
-        self.assertEquals(self.event_source.get_current_key(), 1)
+        self.assertEqual(self.event_source.get_current_key(), 1)
 
         self.reactor.advance(36)
 
-        self.assertEquals(self.event_source.get_current_key(), 2)
+        self.assertEqual(self.event_source.get_current_key(), 2)
 
         channel = self.make_request(
             "PUT",
             "/rooms/%s/typing/%s" % (self.room_id, self.user_id),
             b'{"typing": true, "timeout": 30000}',
         )
-        self.assertEquals(200, channel.code)
+        self.assertEqual(200, channel.code)
 
-        self.assertEquals(self.event_source.get_current_key(), 3)
+        self.assertEqual(self.event_source.get_current_key(), 3)

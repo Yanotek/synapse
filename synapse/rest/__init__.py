@@ -1,18 +1,25 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2014-2016 OpenMarket Ltd
-# Copyright 2018 New Vector Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from typing import TYPE_CHECKING
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
+import logging
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
 
 from synapse.http.server import HttpServer, JsonResource
 from synapse.rest import admin
@@ -20,18 +27,21 @@ from synapse.rest.client import (
     account,
     account_data,
     account_validity,
+    appservice_ping,
     auth,
+    auth_issuer,
     capabilities,
     devices,
     directory,
     events,
     filter,
-    groups,
     initial_sync,
     keys,
     knock,
-    login as v1_login,
+    login,
+    login_token_request,
     logout,
+    mutual_rooms,
     notifications,
     openid,
     password_policy,
@@ -43,13 +53,12 @@ from synapse.rest.client import (
     receipts,
     register,
     relations,
-    report_event,
+    rendezvous,
+    reporting,
     room,
-    room_batch,
     room_keys,
     room_upgrade_rest_servlet,
     sendtodevice,
-    shared_rooms,
     sync,
     tags,
     thirdparty,
@@ -59,8 +68,63 @@ from synapse.rest.client import (
     voip,
 )
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+
+RegisterServletsFunc = Callable[["HomeServer", HttpServer], None]
+
+CLIENT_SERVLET_FUNCTIONS: Tuple[RegisterServletsFunc, ...] = (
+    versions.register_servlets,
+    initial_sync.register_servlets,
+    room.register_deprecated_servlets,
+    events.register_servlets,
+    room.register_servlets,
+    login.register_servlets,
+    profile.register_servlets,
+    presence.register_servlets,
+    directory.register_servlets,
+    voip.register_servlets,
+    pusher.register_servlets,
+    push_rule.register_servlets,
+    logout.register_servlets,
+    sync.register_servlets,
+    filter.register_servlets,
+    account.register_servlets,
+    register.register_servlets,
+    auth.register_servlets,
+    receipts.register_servlets,
+    read_marker.register_servlets,
+    room_keys.register_servlets,
+    keys.register_servlets,
+    tokenrefresh.register_servlets,
+    tags.register_servlets,
+    account_data.register_servlets,
+    reporting.register_servlets,
+    openid.register_servlets,
+    notifications.register_servlets,
+    devices.register_servlets,
+    thirdparty.register_servlets,
+    sendtodevice.register_servlets,
+    user_directory.register_servlets,
+    room_upgrade_rest_servlet.register_servlets,
+    capabilities.register_servlets,
+    account_validity.register_servlets,
+    relations.register_servlets,
+    password_policy.register_servlets,
+    knock.register_servlets,
+    appservice_ping.register_servlets,
+    admin.register_servlets_for_client_rest_resource,
+    mutual_rooms.register_servlets,
+    login_token_request.register_servlets,
+    rendezvous.register_servlets,
+    auth_issuer.register_servlets,
+)
+
+SERVLET_GROUPS: Dict[str, Iterable[RegisterServletsFunc]] = {
+    "client": CLIENT_SERVLET_FUNCTIONS,
+}
 
 
 class ClientRestResource(JsonResource):
@@ -73,60 +137,56 @@ class ClientRestResource(JsonResource):
        * etc
     """
 
-    def __init__(self, hs: "HomeServer"):
+    def __init__(self, hs: "HomeServer", servlet_groups: Optional[List[str]] = None):
         JsonResource.__init__(self, hs, canonical_json=False)
-        self.register_servlets(self, hs)
+        if hs.config.media.can_load_media_repo:
+            # This import is here to prevent a circular import failure
+            from synapse.rest.client import media
+
+            SERVLET_GROUPS["media"] = (media.register_servlets,)
+        self.register_servlets(self, hs, servlet_groups)
 
     @staticmethod
-    def register_servlets(client_resource: HttpServer, hs: "HomeServer") -> None:
-        versions.register_servlets(hs, client_resource)
+    def register_servlets(
+        client_resource: HttpServer,
+        hs: "HomeServer",
+        servlet_groups: Optional[Iterable[str]] = None,
+    ) -> None:
+        # Some servlets are only registered on the main process (and not worker
+        # processes).
+        is_main_process = hs.config.worker.worker_app is None
 
-        # Deprecated in r0
-        initial_sync.register_servlets(hs, client_resource)
-        room.register_deprecated_servlets(hs, client_resource)
+        if not servlet_groups:
+            servlet_groups = SERVLET_GROUPS.keys()
 
-        # Partially deprecated in r0
-        events.register_servlets(hs, client_resource)
+        for servlet_group in servlet_groups:
+            # Fail on unknown servlet groups.
+            if servlet_group not in SERVLET_GROUPS:
+                if servlet_group == "media":
+                    logger.warn(
+                        "media.can_load_media_repo needs to be configured for the media servlet to be available"
+                    )
+                raise RuntimeError(
+                    f"Attempting to register unknown client servlet: '{servlet_group}'"
+                )
 
-        room.register_servlets(hs, client_resource)
-        v1_login.register_servlets(hs, client_resource)
-        profile.register_servlets(hs, client_resource)
-        presence.register_servlets(hs, client_resource)
-        directory.register_servlets(hs, client_resource)
-        voip.register_servlets(hs, client_resource)
-        pusher.register_servlets(hs, client_resource)
-        push_rule.register_servlets(hs, client_resource)
-        logout.register_servlets(hs, client_resource)
-        sync.register_servlets(hs, client_resource)
-        filter.register_servlets(hs, client_resource)
-        account.register_servlets(hs, client_resource)
-        register.register_servlets(hs, client_resource)
-        auth.register_servlets(hs, client_resource)
-        receipts.register_servlets(hs, client_resource)
-        read_marker.register_servlets(hs, client_resource)
-        room_keys.register_servlets(hs, client_resource)
-        keys.register_servlets(hs, client_resource)
-        tokenrefresh.register_servlets(hs, client_resource)
-        tags.register_servlets(hs, client_resource)
-        account_data.register_servlets(hs, client_resource)
-        report_event.register_servlets(hs, client_resource)
-        openid.register_servlets(hs, client_resource)
-        notifications.register_servlets(hs, client_resource)
-        devices.register_servlets(hs, client_resource)
-        thirdparty.register_servlets(hs, client_resource)
-        sendtodevice.register_servlets(hs, client_resource)
-        user_directory.register_servlets(hs, client_resource)
-        groups.register_servlets(hs, client_resource)
-        room_upgrade_rest_servlet.register_servlets(hs, client_resource)
-        room_batch.register_servlets(hs, client_resource)
-        capabilities.register_servlets(hs, client_resource)
-        account_validity.register_servlets(hs, client_resource)
-        relations.register_servlets(hs, client_resource)
-        password_policy.register_servlets(hs, client_resource)
-        knock.register_servlets(hs, client_resource)
+            for servletfunc in SERVLET_GROUPS[servlet_group]:
+                if not is_main_process and servletfunc in [
+                    pusher.register_servlets,
+                    logout.register_servlets,
+                    auth.register_servlets,
+                    tokenrefresh.register_servlets,
+                    reporting.register_servlets,
+                    openid.register_servlets,
+                    thirdparty.register_servlets,
+                    room_upgrade_rest_servlet.register_servlets,
+                    account_validity.register_servlets,
+                    admin.register_servlets_for_client_rest_resource,
+                    mutual_rooms.register_servlets,
+                    login_token_request.register_servlets,
+                    rendezvous.register_servlets,
+                    auth_issuer.register_servlets,
+                ]:
+                    continue
 
-        # moving to /_synapse/admin
-        admin.register_servlets_for_client_rest_resource(hs, client_resource)
-
-        # unstable
-        shared_rooms.register_servlets(hs, client_resource)
+                servletfunc(hs, client_resource)

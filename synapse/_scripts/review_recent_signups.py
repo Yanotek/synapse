@@ -1,16 +1,23 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2021 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import argparse
 import sys
@@ -20,7 +27,12 @@ from typing import List
 
 import attr
 
-from synapse.config._base import RootConfig, find_config_files, read_config_files
+from synapse.config._base import (
+    Config,
+    RootConfig,
+    find_config_files,
+    read_config_files,
+)
 from synapse.config.database import DatabaseConfig
 from synapse.storage.database import DatabasePool, LoggingTransaction, make_conn
 from synapse.storage.engines import create_engine
@@ -41,7 +53,9 @@ class UserInfo:
     ips: List[str] = attr.Factory(list)
 
 
-def get_recent_users(txn: LoggingTransaction, since_ms: int) -> List[UserInfo]:
+def get_recent_users(
+    txn: LoggingTransaction, since_ms: int, exclude_app_service: bool
+) -> List[UserInfo]:
     """Fetches recently registered users and some info on them."""
 
     sql = """
@@ -50,6 +64,9 @@ def get_recent_users(txn: LoggingTransaction, since_ms: int) -> List[UserInfo]:
             ? <= creation_ts
             AND deactivated = 0
     """
+
+    if exclude_app_service:
+        sql += " AND appservice_id IS NULL"
 
     txn.execute(sql, (since_ms / 1000,))
 
@@ -87,7 +104,7 @@ def get_recent_users(txn: LoggingTransaction, since_ms: int) -> List[UserInfo]:
     return user_infos
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-c",
@@ -108,7 +125,7 @@ def main():
         "-e",
         "--exclude-emails",
         action="store_true",
-        help="Exclude users that have validated email addresses",
+        help="Exclude users that have validated email addresses.",
     )
     parser.add_argument(
         "-u",
@@ -116,18 +133,23 @@ def main():
         action="store_true",
         help="Only print user IDs that match.",
     )
+    parser.add_argument(
+        "-a",
+        "--exclude-app-service",
+        help="Exclude appservice users.",
+        action="store_true",
+    )
 
     config = ReviewConfig()
 
     config_args = parser.parse_args(sys.argv[1:])
     config_files = find_config_files(search_paths=config_args.config_path)
     config_dict = read_config_files(config_files)
-    config.parse_config_dict(
-        config_dict,
-    )
+    config.parse_config_dict(config_dict, "", "")
 
-    since_ms = time.time() * 1000 - config.parse_duration(config_args.since)
+    since_ms = time.time() * 1000 - Config.parse_duration(config_args.since)
     exclude_users_with_email = config_args.exclude_emails
+    exclude_users_with_appservice = config_args.exclude_app_service
     include_context = not config_args.only_users
 
     for database_config in config.database.databases:
@@ -137,7 +159,8 @@ def main():
     engine = create_engine(database_config.config)
 
     with make_conn(database_config, engine, "review_recent_signups") as db_conn:
-        user_infos = get_recent_users(db_conn.cursor(), since_ms)
+        # This generates a type of Cursor, not LoggingTransaction.
+        user_infos = get_recent_users(db_conn.cursor(), since_ms, exclude_users_with_appservice)  # type: ignore[arg-type]
 
     for user_info in user_infos:
         if exclude_users_with_email and user_info.emails:

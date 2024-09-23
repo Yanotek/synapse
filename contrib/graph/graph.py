@@ -1,31 +1,43 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
+# Copyright 2014-2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+#
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
+
 import argparse
 import cgi
 import datetime
 import json
+import urllib.request
+from typing import List
 
 import pydot
-import urllib2
-
-# Copyright 2014-2016 OpenMarket Ltd
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 
-def make_name(pdu_id, origin):
-    return "%s@%s" % (pdu_id, origin)
+def make_name(pdu_id: str, origin: str) -> str:
+    return f"{pdu_id}@{origin}"
 
 
-def make_graph(pdus, room, filename_prefix):
+def make_graph(pdus: List[dict], filename_prefix: str) -> None:
+    """
+    Generate a dot and SVG file for a graph of events in the room based on the
+    topological ordering by querying a homeserver.
+    """
     pdu_map = {}
     node_map = {}
 
@@ -111,10 +123,10 @@ def make_graph(pdus, room, filename_prefix):
     graph.write_svg("%s.svg" % filename_prefix, prog="dot")
 
 
-def get_pdus(host, room):
+def get_pdus(host: str, room: str) -> List[dict]:
     transaction = json.loads(
-        urllib2.urlopen(
-            "http://%s/_matrix/federation/v1/context/%s/" % (host, room)
+        urllib.request.urlopen(
+            f"http://{host}/_matrix/federation/v1/context/{room}/"
         ).read()
     )
 
@@ -141,4 +153,4 @@ if __name__ == "__main__":
 
     pdus = get_pdus(host, room)
 
-    make_graph(pdus, room, prefix)
+    make_graph(pdus, prefix)

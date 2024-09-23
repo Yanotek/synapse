@@ -1,56 +1,83 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2018 Vector Creations Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import List, Optional, Tuple
 
+import attr
+
+from synapse.logging.opentracing import trace
 from synapse.storage._base import SQLBaseStore
+from synapse.storage.database import LoggingTransaction, make_in_list_sql_clause
+from synapse.storage.databases.main.stream import _filter_results_by_stream
+from synapse.types import RoomStreamToken, StrCollection
+from synapse.util.caches.stream_change_cache import StreamChangeCache
+from synapse.util.iterutils import batch_iter
 
 logger = logging.getLogger(__name__)
 
 
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class StateDelta:
+    stream_id: int
+    room_id: str
+    event_type: str
+    state_key: str
+
+    event_id: Optional[str]
+    """new event_id for this state key. None if the state has been deleted."""
+
+    prev_event_id: Optional[str]
+    """previous event_id for this state key. None if it's new state."""
+
+
 class StateDeltasStore(SQLBaseStore):
-    async def get_current_state_deltas(
+    # This class must be mixed in with a child class which provides the following
+    # attribute. TODO: can we get static analysis to enforce this?
+    _curr_state_delta_stream_cache: StreamChangeCache
+
+    async def get_partial_current_state_deltas(
         self, prev_stream_id: int, max_stream_id: int
-    ) -> Tuple[int, List[Dict[str, Any]]]:
+    ) -> Tuple[int, List[StateDelta]]:
         """Fetch a list of room state changes since the given stream id
 
-        Each entry in the result contains the following fields:
-            - stream_id (int)
-            - room_id (str)
-            - type (str): event type
-            - state_key (str):
-            - event_id (str|None): new event_id for this state key. None if the
-                state has been deleted.
-            - prev_event_id (str|None): previous event_id for this state key. None
-                if it's new state.
+        This may be the partial state if we're lazy joining the room.
 
         Args:
             prev_stream_id: point to get changes since (exclusive)
             max_stream_id: the point that we know has been correctly persisted
-               - ie, an upper limit to return changes from.
+                - ie, an upper limit to return changes from.
 
         Returns:
             A tuple consisting of:
-               - the stream id which these results go up to
-               - list of current_state_delta_stream rows. If it is empty, we are
-                 up to date.
+                - the stream id which these results go up to
+                - list of current_state_delta_stream rows. If it is empty, we are
+                  up to date.
         """
         prev_stream_id = int(prev_stream_id)
 
         # check we're not going backwards
-        assert prev_stream_id <= max_stream_id
+        assert (
+            prev_stream_id <= max_stream_id
+        ), f"New stream id {max_stream_id} is smaller than prev stream id {prev_stream_id}"
 
         if not self._curr_state_delta_stream_cache.has_any_entity_changed(
             prev_stream_id
@@ -60,7 +87,9 @@ class StateDeltasStore(SQLBaseStore):
             # max_stream_id.
             return max_stream_id, []
 
-        def get_current_state_deltas_txn(txn):
+        def get_current_state_deltas_txn(
+            txn: LoggingTransaction,
+        ) -> Tuple[int, List[StateDelta]]:
             # First we calculate the max stream id that will give us less than
             # N results.
             # We arbitrarily limit to 100 stream_id entries to ensure we don't
@@ -100,13 +129,25 @@ class StateDeltasStore(SQLBaseStore):
                 ORDER BY stream_id ASC
             """
             txn.execute(sql, (prev_stream_id, clipped_stream_id))
-            return clipped_stream_id, self.db_pool.cursor_to_dict(txn)
+            return clipped_stream_id, [
+                StateDelta(
+                    stream_id=row[0],
+                    room_id=row[1],
+                    event_type=row[2],
+                    state_key=row[3],
+                    event_id=row[4],
+                    prev_event_id=row[5],
+                )
+                for row in txn.fetchall()
+            ]
 
         return await self.db_pool.runInteraction(
             "get_current_state_deltas", get_current_state_deltas_txn
         )
 
-    def _get_max_stream_id_in_current_state_deltas_txn(self, txn):
+    def _get_max_stream_id_in_current_state_deltas_txn(
+        self, txn: LoggingTransaction
+    ) -> int:
         return self.db_pool.simple_select_one_onecol_txn(
             txn,
             table="current_state_delta_stream",
@@ -114,8 +155,108 @@ class StateDeltasStore(SQLBaseStore):
             retcol="COALESCE(MAX(stream_id), -1)",
         )
 
-    async def get_max_stream_id_in_current_state_deltas(self):
+    async def get_max_stream_id_in_current_state_deltas(self) -> int:
         return await self.db_pool.runInteraction(
             "get_max_stream_id_in_current_state_deltas",
             self._get_max_stream_id_in_current_state_deltas_txn,
         )
+
+    @trace
+    async def get_current_state_deltas_for_room(
+        self, room_id: str, from_token: RoomStreamToken, to_token: RoomStreamToken
+    ) -> List[StateDelta]:
+        """Get the state deltas between two tokens."""
+
+        if not self._curr_state_delta_stream_cache.has_entity_changed(
+            room_id, from_token.stream
+        ):
+            return []
+
+        def get_current_state_deltas_for_room_txn(
+            txn: LoggingTransaction,
+        ) -> List[StateDelta]:
+            sql = """
+                SELECT instance_name, stream_id, type, state_key, event_id, prev_event_id
+                FROM current_state_delta_stream
+                WHERE room_id = ? AND ? < stream_id AND stream_id <= ?
+                ORDER BY stream_id ASC
+            """
+            txn.execute(
+                sql, (room_id, from_token.stream, to_token.get_max_stream_pos())
+            )
+
+            return [
+                StateDelta(
+                    stream_id=row[1],
+                    room_id=room_id,
+                    event_type=row[2],
+                    state_key=row[3],
+                    event_id=row[4],
+                    prev_event_id=row[5],
+                )
+                for row in txn
+                if _filter_results_by_stream(from_token, to_token, row[0], row[1])
+            ]
+
+        return await self.db_pool.runInteraction(
+            "get_current_state_deltas_for_room", get_current_state_deltas_for_room_txn
+        )
+
+    @trace
+    async def get_current_state_deltas_for_rooms(
+        self,
+        room_ids: StrCollection,
+        from_token: RoomStreamToken,
+        to_token: RoomStreamToken,
+    ) -> List[StateDelta]:
+        """Get the state deltas between two tokens for the set of rooms."""
+
+        room_ids = self._curr_state_delta_stream_cache.get_entities_changed(
+            room_ids, from_token.stream
+        )
+        if not room_ids:
+            return []
+
+        def get_current_state_deltas_for_rooms_txn(
+            txn: LoggingTransaction,
+            room_ids: StrCollection,
+        ) -> List[StateDelta]:
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "room_id", room_ids
+            )
+
+            sql = f"""
+                SELECT instance_name, stream_id, room_id, type, state_key, event_id, prev_event_id
+                FROM current_state_delta_stream
+                WHERE {clause} AND ? < stream_id AND stream_id <= ?
+                ORDER BY stream_id ASC
+            """
+            args.append(from_token.stream)
+            args.append(to_token.get_max_stream_pos())
+
+            txn.execute(sql, args)
+
+            return [
+                StateDelta(
+                    stream_id=row[1],
+                    room_id=row[2],
+                    event_type=row[3],
+                    state_key=row[4],
+                    event_id=row[5],
+                    prev_event_id=row[6],
+                )
+                for row in txn
+                if _filter_results_by_stream(from_token, to_token, row[0], row[1])
+            ]
+
+        results = []
+        for batch in batch_iter(room_ids, 1000):
+            deltas = await self.db_pool.runInteraction(
+                "get_current_state_deltas_for_rooms",
+                get_current_state_deltas_for_rooms_txn,
+                batch,
+            )
+
+            results.extend(deltas)
+
+        return results

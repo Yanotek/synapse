@@ -1,16 +1,15 @@
 # Introduction
 
-Welcome to the documentation repository for Synapse, a 
-[Matrix](https://matrix.org) homeserver implementation developed by the matrix.org core 
-team.
+Welcome to the documentation repository for Synapse, a
+[Matrix](https://matrix.org) homeserver implementation developed by Element.
 
 ## Installing and using Synapse
 
 This documentation covers topics for **installation**, **configuration** and
-**maintainence** of your Synapse process:
+**maintenance** of your Synapse process:
 
 * Learn how to [install](setup/installation.md) and
-  [configure](usage/configuration/index.html) your own instance, perhaps with [Single
+  [configure](usage/configuration/config_documentation.md) your own instance, perhaps with [Single
   Sign-On](usage/configuration/user_authentication/index.html).
 
 * See how to [upgrade](upgrade.md) between Synapse versions.
@@ -37,17 +36,17 @@ following documentation:
 * Read the [Contributing Guide](development/contributing_guide.md). It is meant
   to walk new contributors through the process of developing and submitting a
   change to the Synapse codebase (which is [hosted on
-  GitHub](https://github.com/matrix-org/synapse)).
+  GitHub](https://github.com/element-hq/synapse)).
 
 * Set up your [development
   environment](development/contributing_guide.md#2-what-do-i-need), then learn
   how to [lint](development/contributing_guide.md#run-the-linters) and
   [test](development/contributing_guide.md#8-test-test-test) your code.
 
-* Look at [the issue tracker](https://github.com/matrix-org/synapse/issues) for
+* Look at [the issue tracker](https://github.com/element-hq/synapse/issues) for
   bugs to fix or features to add. If you're new, it may be best to start with
   those labeled [good first
-  issue](https://github.com/matrix-org/synapse/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+  issue](https://github.com/element-hq/synapse/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
 
 * Understand [how Synapse is
   built](development/internal_documentation/index.html), how to [migrate
@@ -59,21 +58,10 @@ following documentation:
   do so!
 
 * And finally, contribute to this documentation! The source for which is
-  [located here](https://github.com/matrix-org/synapse/tree/develop/docs).
-
-## Donating to Synapse development
-
-Want to help keep Synapse going but don't know how to code? Synapse is a
-[Matrix.org Foundation](https://matrix.org) project. Consider becoming a
-supportor on [Liberapay](https://liberapay.com/matrixdotorg),
-[Patreon](https://patreon.com/matrixdotorg) or through
-[PayPal](https://paypal.me/matrixdotorg) via a one-time donation.
-
-If you are an organisation or enterprise and would like to sponsor development,
-reach out to us over email at: support (at) matrix.org
+  [located here](https://github.com/element-hq/synapse/tree/develop/docs).
 
 ## Reporting a security vulnerability
 
-If you've found a security issue in Synapse or any other Matrix.org Foundation
-project, please report it to us in accordance with our [Security Disclosure
-Policy](https://www.matrix.org/security-disclosure-policy/). Thank you!
+If you've found a security issue in Synapse or any other Element project,
+please report it to us in accordance with our [Security Disclosure
+Policy](https://element.io/security/security-disclosure-policy). Thank you!

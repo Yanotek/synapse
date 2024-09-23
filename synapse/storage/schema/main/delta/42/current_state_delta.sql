@@ -1,3 +1,22 @@
+--
+-- This file is licensed under the Affero General Public License (AGPL) version 3.
+--
+-- Copyright (C) 2023 New Vector, Ltd
+--
+-- This program is free software: you can redistribute it and/or modify
+-- it under the terms of the GNU Affero General Public License as
+-- published by the Free Software Foundation, either version 3 of the
+-- License, or (at your option) any later version.
+--
+-- See the GNU Affero General Public License for more details:
+-- <https://www.gnu.org/licenses/agpl-3.0.html>.
+--
+-- Originally licensed under the Apache License, Version 2.0:
+-- <http://www.apache.org/licenses/LICENSE-2.0>.
+--
+-- [This file includes modifications made by New Vector Limited]
+--
+--
 /* Copyright 2017 Vector Creations Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +32,10 @@
  * limitations under the License.
  */
 
-
+-- Tracks what the server thinks is the current state of the room as time goes. It does
+-- not track how state progresses from the beginning of the room. So for example, when
+-- you remotely join a room, the first rows will just be the state when you joined and
+-- progress from there.
 CREATE TABLE current_state_delta_stream (
     stream_id BIGINT NOT NULL,
     room_id TEXT NOT NULL,

@@ -1,21 +1,29 @@
 #!/usr/bin/env python
 
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2014-2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 """ Starts a synapse client console. """
 import argparse
+import binascii
 import cmd
 import getpass
 import json
@@ -26,9 +34,8 @@ import urllib
 from http import TwistedHttpClient
 from typing import Optional
 
-import nacl.encoding
-import nacl.signing
 import urlparse
+from signedjson.key import NACL_ED25519, decode_verify_key_bytes
 from signedjson.sign import SignatureVerifyException, verify_signed_json
 
 from twisted.internet import defer, reactor, threads
@@ -41,7 +48,6 @@ TRUSTED_ID_SERVERS = ["localhost:8001"]
 
 
 class SynapseCmd(cmd.Cmd):
-
     """Basic synapse command-line processor.
 
     This processes commands from the user and calls the relevant HTTP methods.
@@ -420,8 +426,8 @@ class SynapseCmd(cmd.Cmd):
                 pubKey = None
                 pubKeyObj = yield self.http_client.do_request("GET", url)
                 if "public_key" in pubKeyObj:
-                    pubKey = nacl.signing.VerifyKey(
-                        pubKeyObj["public_key"], encoder=nacl.encoding.HexEncoder
+                    pubKey = decode_verify_key_bytes(
+                        NACL_ED25519, binascii.unhexlify(pubKeyObj["public_key"])
                     )
                 else:
                     print("No public key found in pubkey response!")
@@ -770,7 +776,7 @@ def main(server_url, identity_server_url, username, token, config_path):
     global CONFIG_JSON
     CONFIG_JSON = config_path  # bit cheeky, but just overwrite the global
     try:
-        with open(config_path, "r") as config:
+        with open(config_path) as config:
             syn_cmd.config = json.load(config)
             try:
                 http_client.verbose = "on" == syn_cmd.config["verbose"]

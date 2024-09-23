@@ -1,23 +1,34 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2019 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
-import json
+from http import HTTPStatus
+
+from twisted.test.proto_helpers import MemoryReactor
 
 from synapse.api.constants import LoginType
 from synapse.api.errors import Codes
 from synapse.rest import admin
 from synapse.rest.client import account, login, password_policy, register
+from synapse.server import HomeServer
+from synapse.util import Clock
 
 from tests import unittest
 
@@ -46,7 +57,7 @@ class PasswordPolicyTestCase(unittest.HomeserverTestCase):
         account.register_servlets,
     ]
 
-    def make_homeserver(self, reactor, clock):
+    def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
         self.register_url = "/_matrix/client/r0/register"
         self.policy = {
             "enabled": True,
@@ -65,12 +76,12 @@ class PasswordPolicyTestCase(unittest.HomeserverTestCase):
         hs = self.setup_test_homeserver(config=config)
         return hs
 
-    def test_get_policy(self):
+    def test_get_policy(self) -> None:
         """Tests if the /password_policy endpoint returns the configured policy."""
 
         channel = self.make_request("GET", "/_matrix/client/r0/password_policy")
 
-        self.assertEqual(channel.code, 200, channel.result)
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.result)
         self.assertEqual(
             channel.json_body,
             {
@@ -83,70 +94,70 @@ class PasswordPolicyTestCase(unittest.HomeserverTestCase):
             channel.result,
         )
 
-    def test_password_too_short(self):
-        request_data = json.dumps({"username": "kermit", "password": "shorty"})
+    def test_password_too_short(self) -> None:
+        request_data = {"username": "kermit", "password": "shorty"}
         channel = self.make_request("POST", self.register_url, request_data)
 
-        self.assertEqual(channel.code, 400, channel.result)
+        self.assertEqual(channel.code, HTTPStatus.BAD_REQUEST, channel.result)
         self.assertEqual(
             channel.json_body["errcode"],
             Codes.PASSWORD_TOO_SHORT,
             channel.result,
         )
 
-    def test_password_no_digit(self):
-        request_data = json.dumps({"username": "kermit", "password": "longerpassword"})
+    def test_password_no_digit(self) -> None:
+        request_data = {"username": "kermit", "password": "longerpassword"}
         channel = self.make_request("POST", self.register_url, request_data)
 
-        self.assertEqual(channel.code, 400, channel.result)
+        self.assertEqual(channel.code, HTTPStatus.BAD_REQUEST, channel.result)
         self.assertEqual(
             channel.json_body["errcode"],
             Codes.PASSWORD_NO_DIGIT,
             channel.result,
         )
 
-    def test_password_no_symbol(self):
-        request_data = json.dumps({"username": "kermit", "password": "l0ngerpassword"})
+    def test_password_no_symbol(self) -> None:
+        request_data = {"username": "kermit", "password": "l0ngerpassword"}
         channel = self.make_request("POST", self.register_url, request_data)
 
-        self.assertEqual(channel.code, 400, channel.result)
+        self.assertEqual(channel.code, HTTPStatus.BAD_REQUEST, channel.result)
         self.assertEqual(
             channel.json_body["errcode"],
             Codes.PASSWORD_NO_SYMBOL,
             channel.result,
         )
 
-    def test_password_no_uppercase(self):
-        request_data = json.dumps({"username": "kermit", "password": "l0ngerpassword!"})
+    def test_password_no_uppercase(self) -> None:
+        request_data = {"username": "kermit", "password": "l0ngerpassword!"}
         channel = self.make_request("POST", self.register_url, request_data)
 
-        self.assertEqual(channel.code, 400, channel.result)
+        self.assertEqual(channel.code, HTTPStatus.BAD_REQUEST, channel.result)
         self.assertEqual(
             channel.json_body["errcode"],
             Codes.PASSWORD_NO_UPPERCASE,
             channel.result,
         )
 
-    def test_password_no_lowercase(self):
-        request_data = json.dumps({"username": "kermit", "password": "L0NGERPASSWORD!"})
+    def test_password_no_lowercase(self) -> None:
+        request_data = {"username": "kermit", "password": "L0NGERPASSWORD!"}
         channel = self.make_request("POST", self.register_url, request_data)
 
-        self.assertEqual(channel.code, 400, channel.result)
+        self.assertEqual(channel.code, HTTPStatus.BAD_REQUEST, channel.result)
         self.assertEqual(
             channel.json_body["errcode"],
             Codes.PASSWORD_NO_LOWERCASE,
             channel.result,
         )
 
-    def test_password_compliant(self):
-        request_data = json.dumps({"username": "kermit", "password": "L0ngerpassword!"})
+    def test_password_compliant(self) -> None:
+        request_data = {"username": "kermit", "password": "L0ngerpassword!"}
         channel = self.make_request("POST", self.register_url, request_data)
 
         # Getting a 401 here means the password has passed validation and the server has
         # responded with a list of registration flows.
-        self.assertEqual(channel.code, 401, channel.result)
+        self.assertEqual(channel.code, HTTPStatus.UNAUTHORIZED, channel.result)
 
-    def test_password_change(self):
+    def test_password_change(self) -> None:
         """This doesn't test every possible use case, only that hitting /account/password
         triggers the password validation code.
         """
@@ -156,16 +167,14 @@ class PasswordPolicyTestCase(unittest.HomeserverTestCase):
         user_id = self.register_user("kermit", compliant_password)
         tok = self.login("kermit", compliant_password)
 
-        request_data = json.dumps(
-            {
-                "new_password": not_compliant_password,
-                "auth": {
-                    "password": compliant_password,
-                    "type": LoginType.PASSWORD,
-                    "user": user_id,
-                },
-            }
-        )
+        request_data = {
+            "new_password": not_compliant_password,
+            "auth": {
+                "password": compliant_password,
+                "type": LoginType.PASSWORD,
+                "user": user_id,
+            },
+        }
         channel = self.make_request(
             "POST",
             "/_matrix/client/r0/account/password",
@@ -173,5 +182,5 @@ class PasswordPolicyTestCase(unittest.HomeserverTestCase):
             access_token=tok,
         )
 
-        self.assertEqual(channel.code, 400, channel.result)
+        self.assertEqual(channel.code, HTTPStatus.BAD_REQUEST, channel.result)
         self.assertEqual(channel.json_body["errcode"], Codes.PASSWORD_NO_DIGIT)

@@ -1,26 +1,34 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2021 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 from typing import Any, Dict, List, Tuple
 
 from synapse.config._base import Config, ConfigError
+from synapse.types import JsonDict
 from synapse.util.module_loader import load_module
 
 
 class ModulesConfig(Config):
     section = "modules"
 
-    def read_config(self, config: dict, **kwargs):
+    def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         self.loaded_modules: List[Tuple[Any, Dict]] = []
 
         configured_modules = config.get("modules") or []
@@ -30,20 +38,3 @@ class ModulesConfig(Config):
                 raise ConfigError("expected a mapping", config_path)
 
             self.loaded_modules.append(load_module(module, config_path))
-
-    def generate_config_section(self, **kwargs):
-        return """
-            ## Modules ##
-
-            # Server admins can expand Synapse's functionality with external modules.
-            #
-            # See https://matrix-org.github.io/synapse/latest/modules.html for more
-            # documentation on how to configure or create custom modules for Synapse.
-            #
-            modules:
-                # - module: my_super_module.MySuperClass
-                #   config:
-                #       do_thing: true
-                # - module: my_other_super_module.SomeClass
-                #   config: {}
-            """

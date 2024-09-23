@@ -1,20 +1,25 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2014-2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
-
-import attr
+from typing import TYPE_CHECKING, List, Tuple, Union
 
 from synapse.api.errors import (
     NotFoundError,
@@ -22,6 +27,7 @@ from synapse.api.errors import (
     SynapseError,
     UnrecognizedRequestError,
 )
+from synapse.handlers.push_rules import InvalidRuleException, RuleSpec, check_actions
 from synapse.http.server import HttpServer
 from synapse.http.servlet import (
     RestServlet,
@@ -29,23 +35,14 @@ from synapse.http.servlet import (
     parse_string,
 )
 from synapse.http.site import SynapseRequest
-from synapse.push.baserules import BASE_RULE_IDS, NEW_RULE_IDS
-from synapse.push.clientformat import format_push_rules_for_user
 from synapse.push.rulekinds import PRIORITY_CLASS_MAP
 from synapse.rest.client._base import client_patterns
 from synapse.storage.push_rule import InconsistentRuleException, RuleNotFoundException
 from synapse.types import JsonDict
+from synapse.util.async_helpers import Linearizer
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
-
-
-@attr.s(slots=True, frozen=True, auto_attribs=True)
-class RuleSpec:
-    scope: str
-    template: str
-    rule_id: str
-    attr: Optional[str]
 
 
 class PushRuleRestServlet(RestServlet):
@@ -54,39 +51,52 @@ class PushRuleRestServlet(RestServlet):
         "Unrecognised request: You probably wanted a trailing slash"
     )
 
+    WORKERS_DENIED_METHODS = ["PUT", "DELETE"]
+    CATEGORY = "Push rule requests"
+
     def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.notifier = hs.get_notifier()
-        self._is_worker = hs.config.worker.worker_app is not None
-
-        self._users_new_default_push_rules = (
-            hs.config.server.users_new_default_push_rules
+        self._is_push_worker = (
+            hs.get_instance_name() in hs.config.worker.writers.push_rules
         )
+        self._push_rules_handler = hs.get_push_rules_handler()
+        self._push_rule_linearizer = Linearizer(name="push_rules")
 
     async def on_PUT(self, request: SynapseRequest, path: str) -> Tuple[int, JsonDict]:
-        if self._is_worker:
+        if not self._is_push_worker:
             raise Exception("Cannot handle PUT /push_rules on worker")
 
+        requester = await self.auth.get_user_by_req(request)
+        user_id = requester.user.to_string()
+
+        async with self._push_rule_linearizer.queue(user_id):
+            return await self.handle_put(request, path, user_id)
+
+    async def handle_put(
+        self, request: SynapseRequest, path: str, user_id: str
+    ) -> Tuple[int, JsonDict]:
         spec = _rule_spec_from_path(path.split("/"))
         try:
             priority_class = _priority_class_from_spec(spec)
         except InvalidRuleException as e:
             raise SynapseError(400, str(e))
 
-        requester = await self.auth.get_user_by_req(request)
-
         if "/" in spec.rule_id or "\\" in spec.rule_id:
             raise SynapseError(400, "rule_id may not contain slashes")
 
         content = parse_json_value_from_request(request)
 
-        user_id = requester.user.to_string()
-
         if spec.attr:
-            await self.set_rule_attr(user_id, spec, content)
-            self.notify_user(user_id)
+            try:
+                await self._push_rules_handler.set_rule_attr(user_id, spec, content)
+            except InvalidRuleException as e:
+                raise SynapseError(400, "Invalid actions: %s" % e)
+            except RuleNotFoundException:
+                raise NotFoundError("Unknown rule")
+
             return 200, {}
 
         if spec.rule_id.startswith("."):
@@ -102,23 +112,23 @@ class PushRuleRestServlet(RestServlet):
 
         before = parse_string(request, "before")
         if before:
-            before = _namespaced_rule_id(spec, before)
+            before = f"global/{spec.template}/{before}"
 
         after = parse_string(request, "after")
         if after:
-            after = _namespaced_rule_id(spec, after)
+            after = f"global/{spec.template}/{after}"
 
         try:
             await self.store.add_push_rule(
                 user_id=user_id,
-                rule_id=_namespaced_rule_id_from_spec(spec),
+                rule_id=f"global/{spec.template}/{spec.rule_id}",
                 priority_class=priority_class,
                 conditions=conditions,
                 actions=actions,
                 before=before,
                 after=after,
             )
-            self.notify_user(user_id)
+            self._push_rules_handler.notify_user(user_id)
         except InconsistentRuleException as e:
             raise SynapseError(400, str(e))
         except RuleNotFoundException as e:
@@ -129,19 +139,28 @@ class PushRuleRestServlet(RestServlet):
     async def on_DELETE(
         self, request: SynapseRequest, path: str
     ) -> Tuple[int, JsonDict]:
-        if self._is_worker:
+        if not self._is_push_worker:
             raise Exception("Cannot handle DELETE /push_rules on worker")
-
-        spec = _rule_spec_from_path(path.split("/"))
 
         requester = await self.auth.get_user_by_req(request)
         user_id = requester.user.to_string()
 
-        namespaced_rule_id = _namespaced_rule_id_from_spec(spec)
+        async with self._push_rule_linearizer.queue(user_id):
+            return await self.handle_delete(request, path, user_id)
+
+    async def handle_delete(
+        self,
+        request: SynapseRequest,
+        path: str,
+        user_id: str,
+    ) -> Tuple[int, JsonDict]:
+        spec = _rule_spec_from_path(path.split("/"))
+
+        namespaced_rule_id = f"global/{spec.template}/{spec.rule_id}"
 
         try:
             await self.store.delete_push_rule(user_id, namespaced_rule_id)
-            self.notify_user(user_id)
+            self._push_rules_handler.notify_user(user_id)
             return 200, {}
         except StoreError as e:
             if e.code == 404:
@@ -151,14 +170,12 @@ class PushRuleRestServlet(RestServlet):
 
     async def on_GET(self, request: SynapseRequest, path: str) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request)
-        user_id = requester.user.to_string()
+        requester.user.to_string()
 
         # we build up the full structure and then decide which bits of it
         # to send which means doing unnecessary work sometimes but is
         # is probably not going to make a whole lot of difference
-        rules = await self.store.get_push_rules_for_user(user_id)
-
-        rules = format_push_rules_for_user(requester.user, rules)
+        rules = await self._push_rules_handler.push_rules_for_user(requester.user)
 
         path_parts = path.split("/")[1:]
 
@@ -176,62 +193,8 @@ class PushRuleRestServlet(RestServlet):
         else:
             raise UnrecognizedRequestError()
 
-    def notify_user(self, user_id: str) -> None:
-        stream_id = self.store.get_max_push_rules_stream_id()
-        self.notifier.on_new_event("push_rules_key", stream_id, users=[user_id])
 
-    async def set_rule_attr(
-        self, user_id: str, spec: RuleSpec, val: Union[bool, JsonDict]
-    ) -> None:
-        if spec.attr not in ("enabled", "actions"):
-            # for the sake of potential future expansion, shouldn't report
-            # 404 in the case of an unknown request so check it corresponds to
-            # a known attribute first.
-            raise UnrecognizedRequestError()
-
-        namespaced_rule_id = _namespaced_rule_id_from_spec(spec)
-        rule_id = spec.rule_id
-        is_default_rule = rule_id.startswith(".")
-        if is_default_rule:
-            if namespaced_rule_id not in BASE_RULE_IDS:
-                raise NotFoundError("Unknown rule %s" % (namespaced_rule_id,))
-        if spec.attr == "enabled":
-            if isinstance(val, dict) and "enabled" in val:
-                val = val["enabled"]
-            if not isinstance(val, bool):
-                # Legacy fallback
-                # This should *actually* take a dict, but many clients pass
-                # bools directly, so let's not break them.
-                raise SynapseError(400, "Value for 'enabled' must be boolean")
-            await self.store.set_push_rule_enabled(
-                user_id, namespaced_rule_id, val, is_default_rule
-            )
-        elif spec.attr == "actions":
-            if not isinstance(val, dict):
-                raise SynapseError(400, "Value must be a dict")
-            actions = val.get("actions")
-            if not isinstance(actions, list):
-                raise SynapseError(400, "Value for 'actions' must be dict")
-            _check_actions(actions)
-            namespaced_rule_id = _namespaced_rule_id_from_spec(spec)
-            rule_id = spec.rule_id
-            is_default_rule = rule_id.startswith(".")
-            if is_default_rule:
-                if user_id in self._users_new_default_push_rules:
-                    rule_ids = NEW_RULE_IDS
-                else:
-                    rule_ids = BASE_RULE_IDS
-
-                if namespaced_rule_id not in rule_ids:
-                    raise SynapseError(404, "Unknown rule %r" % (namespaced_rule_id,))
-            await self.store.set_push_rule_actions(
-                user_id, namespaced_rule_id, actions, is_default_rule
-            )
-        else:
-            raise UnrecognizedRequestError()
-
-
-def _rule_spec_from_path(path: Sequence[str]) -> RuleSpec:
+def _rule_spec_from_path(path: List[str]) -> RuleSpec:
     """Turn a sequence of path components into a rule spec
 
     Args:
@@ -300,22 +263,9 @@ def _rule_tuple_from_request_object(
         raise InvalidRuleException("No actions found")
     actions = req_obj["actions"]
 
-    _check_actions(actions)
+    check_actions(actions)
 
     return conditions, actions
-
-
-def _check_actions(actions: List[Union[str, JsonDict]]) -> None:
-    if not isinstance(actions, list):
-        raise InvalidRuleException("No actions found")
-
-    for a in actions:
-        if a in ["notify", "dont_notify", "coalesce"]:
-            pass
-        elif isinstance(a, dict) and "set_tweak" in a:
-            pass
-        else:
-            raise InvalidRuleException("Unrecognised action")
 
 
 def _filter_ruleset_with_path(ruleset: JsonDict, path: List[str]) -> JsonDict:
@@ -364,18 +314,6 @@ def _priority_class_from_spec(spec: RuleSpec) -> int:
     pc = PRIORITY_CLASS_MAP[spec.template]
 
     return pc
-
-
-def _namespaced_rule_id_from_spec(spec: RuleSpec) -> str:
-    return _namespaced_rule_id(spec, spec.rule_id)
-
-
-def _namespaced_rule_id(spec: RuleSpec, rule_id: str) -> str:
-    return "global/%s/%s" % (spec.template, rule_id)
-
-
-class InvalidRuleException(Exception):
-    pass
 
 
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:

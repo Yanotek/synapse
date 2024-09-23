@@ -1,16 +1,24 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
+# Copyright 2021 The Matrix.org Foundation C.I.C.
 # Copyright 2014-2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 import argparse
 import logging
 import logging.config
@@ -18,7 +26,7 @@ import os
 import sys
 import threading
 from string import Template
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import yaml
 from zope.interface import implementer
@@ -31,15 +39,16 @@ from twisted.logger import (
     globalLogBeginner,
 )
 
-import synapse
-from synapse.logging._structured import setup_structured_logging
 from synapse.logging.context import LoggingContextFilter
 from synapse.logging.filter import MetadataFilter
-from synapse.util.versionstring import get_version_string
+from synapse.synapse_rust import reset_logging_config
+from synapse.types import JsonDict
 
+from ..util import SYNAPSE_VERSION
 from ._base import Config, ConfigError
 
 if TYPE_CHECKING:
+    from synapse.config.homeserver import HomeServerConfig
     from synapse.server import HomeServer
 
 DEFAULT_LOG_CONFIG = Template(
@@ -52,8 +61,8 @@ DEFAULT_LOG_CONFIG = Template(
 # Synapse also supports structured logging for machine readable logs which can
 # be ingested by ELK stacks. See [2] for details.
 #
-# [1]: https://docs.python.org/3.7/library/logging.config.html#configuration-dictionary-schema
-# [2]: https://matrix-org.github.io/synapse/latest/structured_logging.html
+# [1]: https://docs.python.org/3/library/logging.config.html#configuration-dictionary-schema
+# [2]: https://element-hq.github.io/synapse/latest/structured_logging.html
 
 version: 1
 
@@ -109,22 +118,13 @@ loggers:
         # information such as access tokens.
         level: INFO
 
-    twisted:
-        # We send the twisted logging directly to the file handler,
-        # to work around https://github.com/matrix-org/synapse/issues/3471
-        # when using "buffer" logger. Use "console" to log to stderr instead.
-        handlers: [file]
-        propagate: false
-
 root:
     level: INFO
 
     # Write logs to the `buffer` handler, which will buffer them together in memory,
     # then write them to a file.
     #
-    # Replace "buffer" with "console" to log to stderr instead. (Note that you'll
-    # also need to update the configuration for the `twisted` logger above, in
-    # this case.)
+    # Replace "buffer" with "console" to log to stderr instead.
     #
     handlers: [buffer]
 
@@ -137,38 +137,41 @@ Support for the log_file configuration option and --log-file command-line option
 removed in Synapse 1.3.0. You should instead set up a separate log configuration file.
 """
 
+STRUCTURED_ERROR = """\
+Support for the structured configuration option was removed in Synapse 1.54.0.
+You should instead use the standard logging configuration. See
+https://element-hq.github.io/synapse/v1.54/structured_logging.html
+"""
+
 
 class LoggingConfig(Config):
     section = "logging"
 
-    def read_config(self, config, **kwargs):
+    def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         if config.get("log_file"):
             raise ConfigError(LOG_FILE_ERROR)
         self.log_config = self.abspath(config.get("log_config"))
         self.no_redirect_stdio = config.get("no_redirect_stdio", False)
 
-    def generate_config_section(self, config_dir_path, server_name, **kwargs):
+    def generate_config_section(
+        self, config_dir_path: str, server_name: str, **kwargs: Any
+    ) -> str:
         log_config = os.path.join(config_dir_path, server_name + ".log.config")
         return (
             """\
-        ## Logging ##
-
-        # A yaml python logging config file as described by
-        # https://docs.python.org/3.7/library/logging.config.html#configuration-dictionary-schema
-        #
         log_config: "%(log_config)s"
         """
             % locals()
         )
 
-    def read_arguments(self, args):
+    def read_arguments(self, args: argparse.Namespace) -> None:
         if args.no_redirect_stdio is not None:
             self.no_redirect_stdio = args.no_redirect_stdio
         if args.log_file is not None:
             raise ConfigError(LOG_FILE_ERROR)
 
     @staticmethod
-    def add_arguments(parser):
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
         logging_group = parser.add_argument_group("logging")
         logging_group.add_argument(
             "-n",
@@ -185,7 +188,7 @@ class LoggingConfig(Config):
             help=argparse.SUPPRESS,
         )
 
-    def generate_files(self, config, config_dir_path):
+    def generate_files(self, config: Dict[str, Any], config_dir_path: str) -> None:
         log_config = config.get("log_config")
         if log_config and not os.path.exists(log_config):
             log_file = self.abspath("homeserver.log")
@@ -197,10 +200,32 @@ class LoggingConfig(Config):
                 log_config_file.write(DEFAULT_LOG_CONFIG.substitute(log_file=log_file))
 
 
-def _setup_stdlib_logging(config, log_config_path, logBeginner: LogBeginner) -> None:
+def _setup_stdlib_logging(
+    config: "HomeServerConfig", log_config_path: Optional[str], logBeginner: LogBeginner
+) -> None:
     """
     Set up Python standard library logging.
     """
+
+    # We add a log record factory that runs all messages through the
+    # LoggingContextFilter so that we get the context *at the time we log*
+    # rather than when we write to a handler. This can be done in config using
+    # filter options, but care must when using e.g. MemoryHandler to buffer
+    # writes.
+
+    log_context_filter = LoggingContextFilter()
+    log_metadata_filter = MetadataFilter({"server_name": config.server.server_name})
+    old_factory = logging.getLogRecordFactory()
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = old_factory(*args, **kwargs)
+        log_context_filter.filter(record)
+        log_metadata_filter.filter(record)
+        return record
+
+    logging.setLogRecordFactory(factory)
+
+    # Configure the logger with the initial configuration.
     if log_config_path is None:
         log_format = (
             "%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(request)s"
@@ -219,24 +244,6 @@ def _setup_stdlib_logging(config, log_config_path, logBeginner: LogBeginner) -> 
     else:
         # Load the logging configuration.
         _load_logging_config(log_config_path)
-
-    # We add a log record factory that runs all messages through the
-    # LoggingContextFilter so that we get the context *at the time we log*
-    # rather than when we write to a handler. This can be done in config using
-    # filter options, but care must when using e.g. MemoryHandler to buffer
-    # writes.
-
-    log_context_filter = LoggingContextFilter()
-    log_metadata_filter = MetadataFilter({"server_name": config.server.server_name})
-    old_factory = logging.getLogRecordFactory()
-
-    def factory(*args, **kwargs):
-        record = old_factory(*args, **kwargs)
-        log_context_filter.filter(record)
-        log_metadata_filter.filter(record)
-        return record
-
-    logging.setLogRecordFactory(factory)
 
     # Route Twisted's native logging through to the standard library logging
     # system.
@@ -289,15 +296,17 @@ def _load_logging_config(log_config_path: str) -> None:
     if not log_config:
         logging.warning("Loaded a blank logging config?")
 
-    # If the old structured logging configuration is being used, convert it to
-    # the new style configuration.
+    # If the old structured logging configuration is being used, raise an error.
     if "structured" in log_config and log_config.get("structured"):
-        log_config = setup_structured_logging(log_config)
+        raise ConfigError(STRUCTURED_ERROR)
 
     logging.config.dictConfig(log_config)
 
+    # Blow away the pyo3-log cache so that it reloads the configuration.
+    reset_logging_config()
 
-def _reload_logging_config(log_config_path):
+
+def _reload_logging_config(log_config_path: Optional[str]) -> None:
     """
     Reload the log configuration from the file and apply it.
     """
@@ -311,23 +320,24 @@ def _reload_logging_config(log_config_path):
 
 def setup_logging(
     hs: "HomeServer",
-    config,
-    use_worker_options=False,
+    config: "HomeServerConfig",
+    use_worker_options: bool = False,
     logBeginner: LogBeginner = globalLogBeginner,
 ) -> None:
     """
     Set up the logging subsystem.
 
     Args:
-        config (LoggingConfig | synapse.config.worker.WorkerConfig):
-            configuration data
+        config: configuration data
 
-        use_worker_options (bool): True to use the 'worker_log_config' option
+        use_worker_options: True to use the 'worker_log_config' option
             instead of 'log_config'.
 
         logBeginner: The Twisted logBeginner to use.
 
     """
+    from twisted.internet import reactor
+
     log_config_path = (
         config.worker.worker_log_config
         if use_worker_options
@@ -343,6 +353,15 @@ def setup_logging(
 
     # Log immediately so we can grep backwards.
     logging.warning("***** STARTING SERVER *****")
-    logging.warning("Server %s version %s", sys.argv[0], get_version_string(synapse))
+    logging.warning(
+        "Server %s version %s",
+        sys.argv[0],
+        SYNAPSE_VERSION,
+    )
+    logging.warning("Copyright (c) 2023 New Vector, Inc")
+    logging.warning(
+        "Licensed under the AGPL 3.0 license. Website: https://github.com/element-hq/synapse"
+    )
     logging.info("Server hostname: %s", config.server.server_name)
     logging.info("Instance name: %s", hs.get_instance_name())
+    logging.info("Twisted reactor: %s", type(reactor).__name__)

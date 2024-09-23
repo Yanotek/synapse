@@ -1,30 +1,43 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 #  Copyright 2020 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
-from typing import Optional
-from unittest.mock import Mock
+from typing import Any, Dict, Optional, Set, Tuple
+from unittest.mock import AsyncMock, Mock
 
 import attr
 
-from synapse.api.errors import RedirectException
+from twisted.test.proto_helpers import MemoryReactor
 
-from tests.test_utils import simple_async_mock
+from synapse.api.errors import RedirectException
+from synapse.module_api import ModuleApi
+from synapse.server import HomeServer
+from synapse.types import JsonDict
+from synapse.util import Clock
+
 from tests.unittest import HomeserverTestCase, override_config
 
 # Check if we have the dependencies to run the tests.
 try:
     import saml2.config
+    import saml2.response
     from saml2.sigver import SigverError
 
     has_saml2 = True
@@ -52,39 +65,47 @@ class FakeAuthnResponse:
 
 
 class TestMappingProvider:
-    def __init__(self, config, module):
+    def __init__(self, config: None, module: ModuleApi):
         pass
 
     @staticmethod
-    def parse_config(config):
-        return
+    def parse_config(config: JsonDict) -> None:
+        return None
 
     @staticmethod
-    def get_saml_attributes(config):
+    def get_saml_attributes(config: None) -> Tuple[Set[str], Set[str]]:
         return {"uid"}, {"displayName"}
 
-    def get_remote_user_id(self, saml_response, client_redirect_url):
+    def get_remote_user_id(
+        self, saml_response: "saml2.response.AuthnResponse", client_redirect_url: str
+    ) -> str:
         return saml_response.ava["uid"]
 
     def saml_response_to_user_attributes(
-        self, saml_response, failures, client_redirect_url
-    ):
+        self,
+        saml_response: "saml2.response.AuthnResponse",
+        failures: int,
+        client_redirect_url: str,
+    ) -> dict:
         localpart = saml_response.ava["username"] + (str(failures) if failures else "")
         return {"mxid_localpart": localpart, "displayname": None}
 
 
 class TestRedirectMappingProvider(TestMappingProvider):
     def saml_response_to_user_attributes(
-        self, saml_response, failures, client_redirect_url
-    ):
+        self,
+        saml_response: "saml2.response.AuthnResponse",
+        failures: int,
+        client_redirect_url: str,
+    ) -> dict:
         raise RedirectException(b"https://custom-saml-redirect/")
 
 
 class SamlHandlerTestCase(HomeserverTestCase):
-    def default_config(self):
+    def default_config(self) -> Dict[str, Any]:
         config = super().default_config()
         config["public_baseurl"] = BASE_URL
-        saml_config = {
+        saml_config: Dict[str, Any] = {
             "sp_config": {"metadata": {}},
             # Disable grandfathering.
             "grandfathered_mxid_source_attribute": None,
@@ -98,7 +119,7 @@ class SamlHandlerTestCase(HomeserverTestCase):
 
         return config
 
-    def make_homeserver(self, reactor, clock):
+    def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
         hs = self.setup_test_homeserver()
 
         self.handler = hs.get_saml_handler()
@@ -114,12 +135,12 @@ class SamlHandlerTestCase(HomeserverTestCase):
     elif not has_xmlsec1:
         skip = "Requires xmlsec1"
 
-    def test_map_saml_response_to_user(self):
+    def test_map_saml_response_to_user(self) -> None:
         """Ensure that mapping the SAML response returned from a provider to an MXID works properly."""
 
         # stub out the auth handler
         auth_handler = self.hs.get_auth_handler()
-        auth_handler.complete_sso_login = simple_async_mock()
+        auth_handler.complete_sso_login = AsyncMock()  # type: ignore[method-assign]
 
         # send a mocked-up SAML response to the callback
         saml_response = FakeAuthnResponse({"uid": "test_user", "username": "test_user"})
@@ -130,20 +151,26 @@ class SamlHandlerTestCase(HomeserverTestCase):
 
         # check that the auth handler got called as expected
         auth_handler.complete_sso_login.assert_called_once_with(
-            "@test_user:test", "saml", request, "redirect_uri", None, new_user=True
+            "@test_user:test",
+            "saml",
+            request,
+            "redirect_uri",
+            None,
+            new_user=True,
+            auth_provider_session_id=None,
         )
 
     @override_config({"saml2_config": {"grandfathered_mxid_source_attribute": "mxid"}})
-    def test_map_saml_response_to_existing_user(self):
+    def test_map_saml_response_to_existing_user(self) -> None:
         """Existing users can log in with SAML account."""
-        store = self.hs.get_datastore()
+        store = self.hs.get_datastores().main
         self.get_success(
             store.register_user(user_id="@test_user:test", password_hash=None)
         )
 
         # stub out the auth handler
         auth_handler = self.hs.get_auth_handler()
-        auth_handler.complete_sso_login = simple_async_mock()
+        auth_handler.complete_sso_login = AsyncMock()  # type: ignore[method-assign]
 
         # Map a user via SSO.
         saml_response = FakeAuthnResponse(
@@ -156,7 +183,13 @@ class SamlHandlerTestCase(HomeserverTestCase):
 
         # check that the auth handler got called as expected
         auth_handler.complete_sso_login.assert_called_once_with(
-            "@test_user:test", "saml", request, "", None, new_user=False
+            "@test_user:test",
+            "saml",
+            request,
+            "",
+            None,
+            new_user=False,
+            auth_provider_session_id=None,
         )
 
         # Subsequent calls should map to the same mxid.
@@ -165,19 +198,25 @@ class SamlHandlerTestCase(HomeserverTestCase):
             self.handler._handle_authn_response(request, saml_response, "")
         )
         auth_handler.complete_sso_login.assert_called_once_with(
-            "@test_user:test", "saml", request, "", None, new_user=False
+            "@test_user:test",
+            "saml",
+            request,
+            "",
+            None,
+            new_user=False,
+            auth_provider_session_id=None,
         )
 
-    def test_map_saml_response_to_invalid_localpart(self):
+    def test_map_saml_response_to_invalid_localpart(self) -> None:
         """If the mapping provider generates an invalid localpart it should be rejected."""
 
         # stub out the auth handler
         auth_handler = self.hs.get_auth_handler()
-        auth_handler.complete_sso_login = simple_async_mock()
+        auth_handler.complete_sso_login = AsyncMock()  # type: ignore[method-assign]
 
         # mock out the error renderer too
         sso_handler = self.hs.get_sso_handler()
-        sso_handler.render_error = Mock(return_value=None)
+        sso_handler.render_error = Mock(return_value=None)  # type: ignore[method-assign]
 
         saml_response = FakeAuthnResponse({"uid": "test", "username": "föö"})
         request = _mock_request()
@@ -189,17 +228,17 @@ class SamlHandlerTestCase(HomeserverTestCase):
         )
         auth_handler.complete_sso_login.assert_not_called()
 
-    def test_map_saml_response_to_user_retries(self):
+    def test_map_saml_response_to_user_retries(self) -> None:
         """The mapping provider can retry generating an MXID if the MXID is already in use."""
 
         # stub out the auth handler and error renderer
         auth_handler = self.hs.get_auth_handler()
-        auth_handler.complete_sso_login = simple_async_mock()
+        auth_handler.complete_sso_login = AsyncMock()  # type: ignore[method-assign]
         sso_handler = self.hs.get_sso_handler()
-        sso_handler.render_error = Mock(return_value=None)
+        sso_handler.render_error = Mock(return_value=None)  # type: ignore[method-assign]
 
         # register a user to occupy the first-choice MXID
-        store = self.hs.get_datastore()
+        store = self.hs.get_datastores().main
         self.get_success(
             store.register_user(user_id="@test_user:test", password_hash=None)
         )
@@ -213,7 +252,13 @@ class SamlHandlerTestCase(HomeserverTestCase):
 
         # test_user is already taken, so test_user1 gets registered instead.
         auth_handler.complete_sso_login.assert_called_once_with(
-            "@test_user1:test", "saml", request, "", None, new_user=True
+            "@test_user1:test",
+            "saml",
+            request,
+            "",
+            None,
+            new_user=True,
+            auth_provider_session_id=None,
         )
         auth_handler.complete_sso_login.reset_mock()
 
@@ -247,7 +292,7 @@ class SamlHandlerTestCase(HomeserverTestCase):
             }
         }
     )
-    def test_map_saml_response_redirect(self):
+    def test_map_saml_response_redirect(self) -> None:
         """Test a mapping provider that raises a RedirectException"""
 
         saml_response = FakeAuthnResponse({"uid": "test", "username": "test_user"})
@@ -268,12 +313,12 @@ class SamlHandlerTestCase(HomeserverTestCase):
             },
         }
     )
-    def test_attribute_requirements(self):
+    def test_attribute_requirements(self) -> None:
         """The required attributes must be met from the SAML response."""
 
         # stub out the auth handler
         auth_handler = self.hs.get_auth_handler()
-        auth_handler.complete_sso_login = simple_async_mock()
+        auth_handler.complete_sso_login = AsyncMock()  # type: ignore[method-assign]
 
         # The response doesn't have the proper userGroup or department.
         saml_response = FakeAuthnResponse({"uid": "test_user", "username": "test_user"})
@@ -309,10 +354,28 @@ class SamlHandlerTestCase(HomeserverTestCase):
 
         # check that the auth handler got called as expected
         auth_handler.complete_sso_login.assert_called_once_with(
-            "@test_user:test", "saml", request, "redirect_uri", None, new_user=True
+            "@test_user:test",
+            "saml",
+            request,
+            "redirect_uri",
+            None,
+            new_user=True,
+            auth_provider_session_id=None,
         )
 
 
-def _mock_request():
+def _mock_request() -> Mock:
     """Returns a mock which will stand in as a SynapseRequest"""
-    return Mock(spec=["getClientIP", "getHeader", "_disconnected"])
+    mock = Mock(
+        spec=[
+            "finish",
+            "getClientAddress",
+            "getHeader",
+            "setHeader",
+            "setResponseCode",
+            "write",
+        ]
+    )
+    # `_disconnected` musn't be another `Mock`, otherwise it will be truthy.
+    mock._disconnected = False
+    return mock

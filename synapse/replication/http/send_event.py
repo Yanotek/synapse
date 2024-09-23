@@ -1,30 +1,39 @@
-# Copyright 2018 New Vector Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This file is licensed under the Affero General Public License (AGPL) version 3.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+#
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Tuple
+
+from twisted.web.server import Request
 
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
-from synapse.events import make_event_from_dict
+from synapse.events import EventBase, make_event_from_dict
 from synapse.events.snapshot import EventContext
-from synapse.http.servlet import parse_json_object_from_request
+from synapse.http.server import HttpServer
 from synapse.replication.http._base import ReplicationEndpoint
-from synapse.types import Requester, UserID
+from synapse.types import JsonDict, Requester, UserID
 from synapse.util.metrics import Measure
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+    from synapse.storage.databases.main import DataStore
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +64,9 @@ class ReplicationSendEventRestServlet(ReplicationEndpoint):
 
         { "stream_id": 12345, "event_id": "$abcdef..." }
 
+    Responds with a 409 when a `PartialStateConflictError` is raised due to an event
+    context that needs to be recomputed due to the un-partial stating of a room.
+
     The returned event ID may not match the sent event if it was deduplicated.
     """
 
@@ -65,23 +77,29 @@ class ReplicationSendEventRestServlet(ReplicationEndpoint):
         super().__init__(hs)
 
         self.event_creation_handler = hs.get_event_creation_handler()
-        self.store = hs.get_datastore()
-        self.storage = hs.get_storage()
+        self.store = hs.get_datastores().main
+        self._storage_controllers = hs.get_storage_controllers()
         self.clock = hs.get_clock()
 
     @staticmethod
-    async def _serialize_payload(
-        event_id, store, event, context, requester, ratelimit, extra_users
-    ):
+    async def _serialize_payload(  # type: ignore[override]
+        event_id: str,
+        store: "DataStore",
+        event: EventBase,
+        context: EventContext,
+        requester: Requester,
+        ratelimit: bool,
+        extra_users: List[UserID],
+    ) -> JsonDict:
         """
         Args:
-            event_id (str)
-            store (DataStore)
-            requester (Requester)
-            event (FrozenEvent)
-            context (EventContext)
-            ratelimit (bool)
-            extra_users (list(UserID)): Any extra users to notify about event
+            event_id
+            store
+            requester
+            event
+            context
+            ratelimit
+            extra_users: Any extra users to notify about event
         """
         serialized_context = await context.serialize(event, store)
 
@@ -100,10 +118,10 @@ class ReplicationSendEventRestServlet(ReplicationEndpoint):
 
         return payload
 
-    async def _handle_request(self, request, event_id):
+    async def _handle_request(  # type: ignore[override]
+        self, request: Request, content: JsonDict, event_id: str
+    ) -> Tuple[int, JsonDict]:
         with Measure(self.clock, "repl_send_event_parse"):
-            content = parse_json_object_from_request(request)
-
             event_dict = content["event"]
             room_ver = KNOWN_ROOM_VERSIONS[content["room_version"]]
             internal_metadata = content["internal_metadata"]
@@ -115,19 +133,19 @@ class ReplicationSendEventRestServlet(ReplicationEndpoint):
             event.internal_metadata.outlier = content["outlier"]
 
             requester = Requester.deserialize(self.store, content["requester"])
-            context = EventContext.deserialize(self.storage, content["context"])
+            context = EventContext.deserialize(
+                self._storage_controllers, content["context"]
+            )
 
             ratelimit = content["ratelimit"]
             extra_users = [UserID.from_string(u) for u in content["extra_users"]]
-
-        request.requester = requester
 
         logger.info(
             "Got event to send with ID: %s into room: %s", event.event_id, event.room_id
         )
 
-        event = await self.event_creation_handler.persist_and_notify_client_event(
-            requester, event, context, ratelimit=ratelimit, extra_users=extra_users
+        event = await self.event_creation_handler.persist_and_notify_client_events(
+            requester, [(event, context)], ratelimit=ratelimit, extra_users=extra_users
         )
 
         return (
@@ -139,5 +157,5 @@ class ReplicationSendEventRestServlet(ReplicationEndpoint):
         )
 
 
-def register_servlets(hs: "HomeServer", http_server):
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     ReplicationSendEventRestServlet(hs).register(http_server)

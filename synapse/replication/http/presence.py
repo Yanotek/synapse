@@ -1,23 +1,32 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
 # Copyright 2020 The Matrix.org Foundation C.I.C.
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 
-from synapse.http.servlet import parse_json_object_from_request
+from twisted.web.server import Request
+
+from synapse.http.server import HttpServer
 from synapse.replication.http._base import ReplicationEndpoint
-from synapse.types import UserID
+from synapse.types import JsonDict, UserID
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -49,18 +58,17 @@ class ReplicationBumpPresenceActiveTime(ReplicationEndpoint):
         self._presence_handler = hs.get_presence_handler()
 
     @staticmethod
-    async def _serialize_payload(user_id):
-        return {}
+    async def _serialize_payload(user_id: str, device_id: Optional[str]) -> JsonDict:  # type: ignore[override]
+        return {"device_id": device_id}
 
-    async def _handle_request(self, request, user_id):
+    async def _handle_request(  # type: ignore[override]
+        self, request: Request, content: JsonDict, user_id: str
+    ) -> Tuple[int, JsonDict]:
         await self._presence_handler.bump_presence_active_time(
-            UserID.from_string(user_id)
+            UserID.from_string(user_id), content.get("device_id")
         )
 
-        return (
-            200,
-            {},
-        )
+        return (200, {})
 
 
 class ReplicationPresenceSetState(ReplicationEndpoint):
@@ -72,8 +80,8 @@ class ReplicationPresenceSetState(ReplicationEndpoint):
 
         {
             "state": { ... },
-            "ignore_status_msg": false,
-            "force_notify": false
+            "force_notify": false,
+            "is_sync": false
         }
 
         200 OK
@@ -92,31 +100,34 @@ class ReplicationPresenceSetState(ReplicationEndpoint):
         self._presence_handler = hs.get_presence_handler()
 
     @staticmethod
-    async def _serialize_payload(
-        user_id, state, ignore_status_msg=False, force_notify=False
-    ):
+    async def _serialize_payload(  # type: ignore[override]
+        user_id: str,
+        device_id: Optional[str],
+        state: JsonDict,
+        force_notify: bool = False,
+        is_sync: bool = False,
+    ) -> JsonDict:
         return {
+            "device_id": device_id,
             "state": state,
-            "ignore_status_msg": ignore_status_msg,
             "force_notify": force_notify,
+            "is_sync": is_sync,
         }
 
-    async def _handle_request(self, request, user_id):
-        content = parse_json_object_from_request(request)
-
+    async def _handle_request(  # type: ignore[override]
+        self, request: Request, content: JsonDict, user_id: str
+    ) -> Tuple[int, JsonDict]:
         await self._presence_handler.set_state(
             UserID.from_string(user_id),
+            content.get("device_id"),
             content["state"],
-            content["ignore_status_msg"],
             content["force_notify"],
+            content.get("is_sync", False),
         )
 
-        return (
-            200,
-            {},
-        )
+        return (200, {})
 
 
-def register_servlets(hs: "HomeServer", http_server):
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     ReplicationBumpPresenceActiveTime(hs).register(http_server)
     ReplicationPresenceSetState(hs).register(http_server)

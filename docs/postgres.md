@@ -1,6 +1,7 @@
 # Using Postgres
 
-Synapse supports PostgreSQL versions 9.6 or later.
+The minimum supported version of PostgreSQL is determined by the [Dependency
+Deprecation Policy](deprecation_policy.md).
 
 ## Install postgres client libraries
 
@@ -15,7 +16,7 @@ connect to a postgres database.
 -   For other pre-built packages, please consult the documentation from
     the relevant package.
 -   If you installed synapse [in a
-    virtualenv](setup/installation.md#installing-from-source), you can install
+    virtualenv](setup/installation.md#installing-as-a-python-module-from-pypi), you can install
     the library with:
 
         ~/synapse/env/bin/pip install "matrix-synapse[postgres]"
@@ -29,16 +30,20 @@ connect to a postgres database.
 
 Assuming your PostgreSQL database user is called `postgres`, first authenticate as the database user with:
 
-    su - postgres
-    # Or, if your system uses sudo to get administrative rights
-    sudo -u postgres bash
+```sh
+su - postgres
+# Or, if your system uses sudo to get administrative rights
+sudo -u postgres bash
+```
 
 Then, create a postgres user and a database with:
 
-    # this will prompt for a password for the new user
-    createuser --pwprompt synapse_user
+```sh
+# this will prompt for a password for the new user
+createuser --pwprompt synapse_user
 
-    createdb --encoding=UTF8 --locale=C --template=template0 --owner=synapse_user synapse
+createdb --encoding=UTF8 --locale=C --template=template0 --owner=synapse_user synapse
+```
 
 The above will create a user called `synapse_user`, and a database called
 `synapse`.
@@ -61,7 +66,7 @@ database:
   args:
     user: <user>
     password: <pass>
-    database: <db>
+    dbname: <db>
     host: <host>
     cp_min: 5
     cp_max: 10
@@ -114,13 +119,16 @@ performance:
 Note that the appropriate values for those fields depend on the amount
 of free memory the database host has available.
 
+Additionally, admins of large deployments might want to consider using huge pages
+to help manage memory, especially when using large values of `shared_buffers`. You
+can read more about that [here](https://www.postgresql.org/docs/10/kernel-resources.html#LINUX-HUGE-PAGES).
 
 ## Porting from SQLite
 
 ### Overview
 
 The script `synapse_port_db` allows porting an existing synapse server
-backed by SQLite to using PostgreSQL. This is done in as a two phase
+backed by SQLite to using PostgreSQL. This is done as a two phase
 process:
 
 1.  Copy the existing SQLite database to a separate location and run
@@ -136,6 +144,14 @@ to do step 2.
 
 It is safe to at any time kill the port script and restart it.
 
+However, under no circumstances should the SQLite database be `VACUUM`ed between
+multiple runs of the script. Doing so can lead to an inconsistent copy of your database
+into Postgres.
+To avoid accidental error, the script will check that SQLite's `auto_vacuum` mechanism
+is disabled, but the script is not able to protect against a manual `VACUUM` operation
+performed either by the administrator or by any automated task that the administrator
+may have configured.
+
 Note that the database may take up significantly more (25% - 100% more)
 space on disk after porting to Postgres.
 
@@ -145,22 +161,28 @@ Firstly, shut down the currently running synapse server and copy its
 database file (typically `homeserver.db`) to another location. Once the
 copy is complete, restart synapse. For instance:
 
-    ./synctl stop
-    cp homeserver.db homeserver.db.snapshot
-    ./synctl start
+```sh
+synctl stop
+cp homeserver.db homeserver.db.snapshot
+synctl start
+```
 
 Copy the old config file into a new config file:
 
-    cp homeserver.yaml homeserver-postgres.yaml
+```sh
+cp homeserver.yaml homeserver-postgres.yaml
+```
 
 Edit the database section as described in the section *Synapse config*
 above and with the SQLite snapshot located at `homeserver.db.snapshot`
 simply run:
 
-    synapse_port_db --sqlite-database homeserver.db.snapshot \
-        --postgres-config homeserver-postgres.yaml
+```sh
+synapse_port_db --sqlite-database homeserver.db.snapshot \
+    --postgres-config homeserver-postgres.yaml
+```
 
-The flag `--curses` displays a coloured curses progress UI.
+The flag `--curses` displays a coloured curses progress UI. (NOTE: if your terminal is too small the script will error out)
 
 If the script took a long time to complete, or time has otherwise passed
 since the original snapshot was taken, repeat the previous steps with a
@@ -170,16 +192,20 @@ To complete the conversion shut down the synapse server and run the port
 script one last time, e.g. if the SQLite database is at `homeserver.db`
 run:
 
-    synapse_port_db --sqlite-database homeserver.db \
-        --postgres-config homeserver-postgres.yaml
+```sh
+synapse_port_db --sqlite-database homeserver.db \
+    --postgres-config homeserver-postgres.yaml
+```
 
 Once that has completed, change the synapse config to point at the
 PostgreSQL database configuration file `homeserver-postgres.yaml`:
 
-    ./synctl stop
-    mv homeserver.yaml homeserver-old-sqlite.yaml
-    mv homeserver-postgres.yaml homeserver.yaml
-    ./synctl start
+```sh
+synctl stop
+mv homeserver.yaml homeserver-old-sqlite.yaml
+mv homeserver-postgres.yaml homeserver.yaml
+synctl start
+```
 
 Synapse should now be running against PostgreSQL.
 
@@ -216,26 +242,16 @@ host    all         all             ::1/128     ident
 
 ### Fixing incorrect `COLLATE` or `CTYPE`
 
-Synapse will refuse to set up a new database if it has the wrong values of
-`COLLATE` and `CTYPE` set, and will log warnings on existing databases. Using
-different locales can cause issues if the locale library is updated from
-underneath the database, or if a different version of the locale is used on any
-replicas.
+Synapse will refuse to start when using a database with incorrect values of
+`COLLATE` and `CTYPE` unless the config flag `allow_unsafe_locale`, found in the
+`database` section of the config, is set to true. Using different locales can
+cause issues if the locale library is updated from underneath the database, or
+if a different version of the locale is used on any replicas.
 
-The safest way to fix the issue is to dump the database and recreate it with
+If you have a database with an unsafe locale, the safest way to fix the issue is to dump the database and recreate it with
 the correct locale parameter (as shown above). It is also possible to change the
 parameters on a live database and run a `REINDEX` on the entire database,
 however extreme care must be taken to avoid database corruption.
 
 Note that the above may fail with an error about duplicate rows if corruption
 has already occurred, and such duplicate rows will need to be manually removed.
-
-### Fixing inconsistent sequences error
-
-Synapse uses Postgres sequences to generate IDs for various tables. A sequence
-and associated table can get out of sync if, for example, Synapse has been
-downgraded and then upgraded again.
-
-To fix the issue shut down Synapse (including any and all workers) and run the
-SQL command included in the error message. Once done Synapse should start
-successfully.

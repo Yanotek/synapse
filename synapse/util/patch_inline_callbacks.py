@@ -1,20 +1,28 @@
-# Copyright 2018 New Vector Ltd
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This file is licensed under the Affero General Public License (AGPL) version 3.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# Copyright (C) 2023 New Vector, Ltd
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+#
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
 
 import functools
 import sys
-from typing import Any, Callable, Generator, List, TypeVar
+from typing import Any, Callable, Generator, List, TypeVar, cast
+
+from typing_extensions import ParamSpec
 
 from twisted.internet import defer
 from twisted.internet.defer import Deferred
@@ -25,6 +33,7 @@ _already_patched = False
 
 
 T = TypeVar("T")
+P = ParamSpec("P")
 
 
 def do_patch() -> None:
@@ -41,13 +50,13 @@ def do_patch() -> None:
         return
 
     def new_inline_callbacks(
-        f: Callable[..., Generator["Deferred[object]", object, T]]
-    ) -> Callable[..., "Deferred[T]"]:
+        f: Callable[P, Generator["Deferred[object]", object, T]]
+    ) -> Callable[P, "Deferred[T]"]:
         @functools.wraps(f)
-        def wrapped(*args: Any, **kwargs: Any) -> "Deferred[T]":
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> "Deferred[T]":
             start_context = current_context()
             changes: List[str] = []
-            orig: Callable[..., "Deferred[T]"] = orig_inline_callbacks(
+            orig: Callable[P, "Deferred[T]"] = orig_inline_callbacks(
                 _check_yield_points(f, changes)
             )
 
@@ -115,7 +124,7 @@ def do_patch() -> None:
 
 
 def _check_yield_points(
-    f: Callable[..., Generator["Deferred[object]", object, T]],
+    f: Callable[P, Generator["Deferred[object]", object, T]],
     changes: List[str],
 ) -> Callable:
     """Wraps a generator that is about to be passed to defer.inlineCallbacks
@@ -138,7 +147,7 @@ def _check_yield_points(
 
     @functools.wraps(f)
     def check_yield_points_inner(
-        *args: Any, **kwargs: Any
+        *args: P.args, **kwargs: P.kwargs
     ) -> Generator["Deferred[object]", object, T]:
         gen = f(*args, **kwargs)
 
@@ -174,7 +183,9 @@ def _check_yield_points(
                         )
                     )
                     changes.append(err)
-                return getattr(e, "value", None)
+                # The `StopIteration` or `_DefGen_Return` contains the return value from the
+                # generator.
+                return cast(T, e.value)
 
             frame = gen.gi_frame
 
@@ -206,7 +217,6 @@ def _check_yield_points(
                 result = Failure()
 
             if current_context() != expected_context:
-
                 # This happens because the context is lost sometime *after* the
                 # previous yield and *after* the current yield. E.g. the
                 # deferred we waited on didn't follow the rules, or we forgot to
@@ -215,13 +225,16 @@ def _check_yield_points(
                 # We don't raise here as its perfectly valid for contexts to
                 # change in a function, as long as it sets the correct context
                 # on resolving (which is checked separately).
-                err = "%s changed context from %s to %s, happened between lines %d and %d in %s" % (
-                    frame.f_code.co_name,
-                    expected_context,
-                    current_context(),
-                    last_yield_line_no,
-                    frame.f_lineno,
-                    frame.f_code.co_filename,
+                err = (
+                    "%s changed context from %s to %s, happened between lines %d and %d in %s"
+                    % (
+                        frame.f_code.co_name,
+                        expected_context,
+                        current_context(),
+                        last_yield_line_no,
+                        frame.f_lineno,
+                        frame.f_code.co_filename,
+                    )
                 )
                 changes.append(err)
 
