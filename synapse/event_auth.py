@@ -493,6 +493,8 @@ def _can_federate(event: "EventBase", auth_events: StateMap["EventBase"]) -> boo
     return creation_event.content.get(EventContentFields.FEDERATE, True) is True
 
 
+
+
 def _is_membership_change_allowed(
     room_version: RoomVersion, event: "EventBase", auth_events: StateMap["EventBase"]
 ) -> None:
@@ -692,13 +694,9 @@ def _is_membership_change_allowed(
             )
         elif target_user_id != event.user_id:
             kick_level = get_named_level(auth_events, "kick", 50)
-
-            if user_level < kick_level or (user_level < 100 and user_level <= target_level):
-                raise UnstableSpecAuthError(
-                    403,
-                    "You cannot kick user %s." % target_user_id,
-                    errcode=Codes.INSUFFICIENT_POWER,
-                )
+            if not _is_one_on_one_room(auth_events):
+                if user_level < kick_level or (user_level < 100 and user_level <= target_level):
+                    raise AuthError(403, "You cannot kick user %s." % target_user_id)
     elif Membership.BAN == membership:
         if user_level < ban_level:
             raise UnstableSpecAuthError(
@@ -733,10 +731,19 @@ def _is_membership_change_allowed(
     else:
         raise AuthError(500, "Unknown membership %s" % membership)
 
+def _is_one_on_one_room(auth_events: StateMap[EventBase]) -> bool:
+    members = [
+        event.state_key 
+        for (event_type, event) in auth_events.items() 
+        if event_type == EventTypes.Member and event.membership == Membership.JOIN
+    ]
+    
+    return len(members) == 2
 
 def _check_event_sender_in_room(
     event: "EventBase", auth_events: StateMap["EventBase"]
 ) -> None:
+
     key = (EventTypes.Member, event.user_id)
     member_event = auth_events.get(key)
 
