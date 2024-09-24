@@ -731,7 +731,8 @@ def _is_membership_change_allowed(
     else:
         raise AuthError(500, "Unknown membership %s" % membership)
 
-def _is_one_on_one_room(auth_events: StateMap[EventBase]) -> bool:
+
+def _is_one_on_one_room(auth_events: StateMap["EventBase"]) -> bool:
     members = [
         event.state_key 
         for (event_type, event) in auth_events.items() 
@@ -739,6 +740,7 @@ def _is_one_on_one_room(auth_events: StateMap[EventBase]) -> bool:
     ]
     
     return len(members) == 2
+
 
 def _check_event_sender_in_room(
     event: "EventBase", auth_events: StateMap["EventBase"]
