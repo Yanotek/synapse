@@ -186,7 +186,7 @@ async def check_state_independent_auth_rules(
         # 1.5 Otherwise, allow
         return
 
-    # 2. Reject if event has auth_events that: ...
+    # 2. Reject if event has auth_events that: ..
     auth_events: ChainMap[str, EventBase] = ChainMap()
     if batched_auth_events:
         # batched_auth_events can become very large. To avoid repeatedly copying it, which
