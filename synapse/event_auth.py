@@ -734,9 +734,9 @@ def _is_membership_change_allowed(
 
 def _is_one_on_one_room(auth_events: StateMap["EventBase"]) -> bool:
     members = [
-        event.state_key 
-        for (event_type, event) in auth_events.items() 
-        if event_type == EventTypes.Member and event.membership == Membership.JOIN
+        state_key 
+        for (event_type, state_key) in auth_events.items() 
+        if event_type == EventTypes.Member
     ]
     
     return len(members) == 2
