@@ -733,7 +733,7 @@ def _is_membership_change_allowed(
 
 
 def _is_one_on_one_room(auth_events: StateMap["EventBase"]) -> bool:
-    return bool(auth_events.get(EventTypes.Encrypted))
+    return bool(auth_events.get(EventTypes.SetEncrypted))
 
 def _check_event_sender_in_room(
     event: "EventBase", auth_events: StateMap["EventBase"]
