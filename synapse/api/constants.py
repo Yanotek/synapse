@@ -108,6 +108,7 @@ class EventTypes:
     RoomHistoryVisibility: Final = "m.room.history_visibility"
     CanonicalAlias: Final = "m.room.canonical_alias"
     Encrypted: Final = "m.room.encrypted"
+    SetEncrypted: Final = "m.set.encrypted"
     RoomAvatar: Final = "m.room.avatar"
     RoomEncryption: Final = "m.room.encryption"
     GuestAccess: Final = "m.room.guest_access"
