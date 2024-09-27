@@ -693,8 +693,8 @@ def _is_membership_change_allowed(
                 errcode=Codes.INSUFFICIENT_POWER,
             )
         elif target_user_id != event.user_id:
-            kick_level = get_named_level(auth_events, "kick", 50)
             if not _is_one_on_one_room(auth_events):
+                kick_level = get_named_level(auth_events, "kick", 50)
                 if user_level < kick_level or (user_level < 100 and user_level <= target_level):
                     raise AuthError(403, "You cannot kick user %s." % target_user_id)
     elif Membership.BAN == membership:
@@ -735,8 +735,8 @@ def _is_membership_change_allowed(
 def _is_one_on_one_room(auth_events: StateMap["EventBase"]) -> bool:
     members = [
         state_key 
-        for (event_type, state_key) in auth_events.items() 
-        if event_type == EventTypes.Member
+        for (event_type, state_key), event in auth_events.items() 
+        if event_type == EventTypes.Member and event.membership == Membership.JOIN
     ]
     
     return len(members) == 2
