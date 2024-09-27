@@ -158,7 +158,7 @@ class ProfileHandler:
         new_displayname: str,
         by_admin: bool = False,
         deactivation: bool = False,
-        propagate: bool = True,
+        propagate: bool = False,
     ) -> None:
         """Set the displayname of a user
 
