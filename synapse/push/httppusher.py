@@ -488,15 +488,15 @@ class HttpPusher(Pusher):
                 content["user_is_target"] = event.state_key == self.user_id
             if self.hs.config.push.push_include_content and event.content:
                 content["content"] = event.content
-
-        # We no longer send aliases separately, instead, we send the human
-        # readable name of the room, which may be an alias.
-        if "sender_display_name" in ctx and len(ctx["sender_display_name"]) > 0:
-            d["notification"]["sender_display_name"] = ctx["sender_display_name"]
-        if "name" in ctx and len(ctx["name"]) > 0:
-            d["notification"]["room_name"] = ctx["name"]
-        if "room_alias" in ctx and len(ctx["room_alias"]) > 0:
-            d["notification"]["room_alias"] = ctx["room_alias"]
+            # We no longer send aliases separately, instead, we send the human
+            # readable name of the room, which may be an alias.
+            if "sender_display_name" in ctx and len(ctx["sender_display_name"]) > 0:
+                content["sender_display_name"] = ctx[
+                    "sender_display_name"]
+            if "name" in ctx and len(ctx["name"]) > 0:
+                content["room_name"] = ctx["name"]
+            if "room_alias" in ctx and len(ctx["room_alias"]) > 0:
+                content["room_alias"] = ctx["room_alias"]
 
         res = await self.dispatch_push(content, tweaks)
 
