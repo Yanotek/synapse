@@ -56,7 +56,7 @@ REMOTE_ROOM_LIST_POLL_INTERVAL = 60 * 1000
 EMPTY_THIRD_PARTY_ID = ThirdPartyInstanceID(None, None)
 
 # Maximum number of local public rooms returned over the CS or SS API
-MAX_PUBLIC_ROOMS_IN_RESPONSE = 100
+MAX_PUBLIC_ROOMS_IN_RESPONSE = 100000
 
 
 class RoomListHandler:
