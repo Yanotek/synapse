@@ -21,9 +21,7 @@
 
 import logging
 import string
-from typing import TYPE_CHECKING, Iterable, List, Optional, Sequence
-
-from typing_extensions import Literal
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Sequence
 
 from synapse.api.constants import MAX_ALIAS_LENGTH, EventTypes
 from synapse.api.errors import (
@@ -265,9 +263,9 @@ class DirectoryHandler:
     async def get_association(self, room_alias: RoomAlias) -> JsonDict:
         room_id = None
         if self.hs.is_mine(room_alias):
-            result: Optional[RoomAliasMapping] = (
-                await self.get_association_from_room_alias(room_alias)
-            )
+            result: Optional[
+                RoomAliasMapping
+            ] = await self.get_association_from_room_alias(room_alias)
 
             if result:
                 room_id = result.room_id
@@ -512,11 +510,9 @@ class DirectoryHandler:
                 raise SynapseError(403, "Not allowed to publish room")
 
             # Check if publishing is blocked by a third party module
-            allowed_by_third_party_rules = (
-                await (
-                    self._third_party_event_rules.check_visibility_can_be_modified(
-                        room_id, visibility
-                    )
+            allowed_by_third_party_rules = await (
+                self._third_party_event_rules.check_visibility_can_be_modified(
+                    room_id, visibility
                 )
             )
             if not allowed_by_third_party_rules:

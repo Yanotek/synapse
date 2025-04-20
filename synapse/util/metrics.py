@@ -22,10 +22,19 @@
 import logging
 from functools import wraps
 from types import TracebackType
-from typing import Awaitable, Callable, Dict, Generator, Optional, Type, TypeVar
+from typing import (
+    Awaitable,
+    Callable,
+    Dict,
+    Generator,
+    Optional,
+    Protocol,
+    Type,
+    TypeVar,
+)
 
 from prometheus_client import CollectorRegistry, Counter, Metric
-from typing_extensions import Concatenate, ParamSpec, Protocol
+from typing_extensions import Concatenate, ParamSpec
 
 from synapse.logging.context import (
     ContextResourceUsage,
@@ -110,7 +119,7 @@ def measure_func(
     """
 
     def wrapper(
-        func: Callable[Concatenate[HasClock, P], Awaitable[R]]
+        func: Callable[Concatenate[HasClock, P], Awaitable[R]],
     ) -> Callable[P, Awaitable[R]]:
         block_name = func.__name__ if name is None else name
 

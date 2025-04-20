@@ -19,17 +19,11 @@
 #
 #
 import collections.abc
-from typing import TYPE_CHECKING, List, Type, Union, cast
+from typing import List, Type, Union, cast
 
 import jsonschema
 
-from synapse._pydantic_compat import HAS_PYDANTIC_V2
-
-if TYPE_CHECKING or HAS_PYDANTIC_V2:
-    from pydantic.v1 import Field, StrictBool, StrictStr
-else:
-    from pydantic import Field, StrictBool, StrictStr
-
+from synapse._pydantic_compat import Field, StrictBool, StrictStr
 from synapse.api.constants import (
     MAX_ALIAS_LENGTH,
     EventContentFields,
@@ -92,9 +86,7 @@ class EventValidator:
 
         # Depending on the room version, ensure the data is spec compliant JSON.
         if event.room_version.strict_canonicaljson:
-            # Note that only the client controlled portion of the event is
-            # checked, since we trust the portions of the event we created.
-            validate_canonicaljson(event.content)
+            validate_canonicaljson(event.get_pdu_json())
 
         if event.type == EventTypes.Aliases:
             if "aliases" in event.content:
