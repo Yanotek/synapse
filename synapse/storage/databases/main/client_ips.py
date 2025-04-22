@@ -20,10 +20,19 @@
 #
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    TypedDict,
+    Union,
+    cast,
+)
 
 import attr
-from typing_extensions import TypedDict
 
 from synapse.metrics.background_process_metrics import wrap_as_background_process
 from synapse.storage._base import SQLBaseStore
@@ -238,9 +247,7 @@ class ClientIpBackgroundUpdateStore(SQLBaseStore):
                 INNER JOIN user_ips USING (user_id, access_token, ip)
                 GROUP BY user_id, access_token, ip
                 HAVING count(*) > 1
-                """.format(
-                    clause
-                ),
+                """.format(clause),
                 args,
             )
             res = cast(
@@ -373,9 +380,7 @@ class ClientIpBackgroundUpdateStore(SQLBaseStore):
                     LIMIT ?
                 ) c
                 INNER JOIN user_ips AS u USING (user_id, device_id, last_seen)
-            """ % {
-                "where_clause": where_clause
-            }
+            """ % {"where_clause": where_clause}
             txn.execute(sql, where_args + [batch_size])
 
             rows = cast(List[Tuple[int, str, str, str, str]], txn.fetchall())

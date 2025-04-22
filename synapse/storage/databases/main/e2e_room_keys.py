@@ -19,9 +19,18 @@
 #
 #
 
-from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Tuple, cast
-
-from typing_extensions import Literal, TypedDict
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Tuple,
+    TypedDict,
+    cast,
+)
 
 from synapse.api.errors import StoreError
 from synapse.logging.opentracing import log_kv, trace
@@ -387,9 +396,7 @@ class EndToEndRoomKeyStore(EndToEndRoomKeyBackgroundStore):
                is_verified, session_data
         FROM e2e_room_keys
         WHERE user_id = ? AND version = ? AND (%s)
-        """ % (
-            " OR ".join(where_clauses)
-        )
+        """ % (" OR ".join(where_clauses))
 
         txn.execute(sql, params)
 
@@ -512,19 +519,16 @@ class EndToEndRoomKeyStore(EndToEndRoomKeyBackgroundStore):
                     # it isn't there.
                     raise StoreError(404, "No backup with that version exists")
 
-            row = cast(
-                Tuple[int, str, str, Optional[int]],
-                self.db_pool.simple_select_one_txn(
-                    txn,
-                    table="e2e_room_keys_versions",
-                    keyvalues={
-                        "user_id": user_id,
-                        "version": this_version,
-                        "deleted": 0,
-                    },
-                    retcols=("version", "algorithm", "auth_data", "etag"),
-                    allow_none=False,
-                ),
+            row = self.db_pool.simple_select_one_txn(
+                txn,
+                table="e2e_room_keys_versions",
+                keyvalues={
+                    "user_id": user_id,
+                    "version": this_version,
+                    "deleted": 0,
+                },
+                retcols=("version", "algorithm", "auth_data", "etag"),
+                allow_none=False,
             )
             return {
                 "auth_data": db_to_json(row[2]),

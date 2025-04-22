@@ -23,14 +23,13 @@ import shutil
 import tempfile
 from binascii import unhexlify
 from io import BytesIO
-from typing import Any, BinaryIO, ClassVar, Dict, List, Optional, Tuple, Union
+from typing import Any, BinaryIO, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 from unittest.mock import MagicMock, Mock, patch
 from urllib import parse
 
 import attr
 from parameterized import parameterized, parameterized_class
 from PIL import Image as Image
-from typing_extensions import Literal
 
 from twisted.internet import defer
 from twisted.internet.defer import Deferred
@@ -43,6 +42,7 @@ from twisted.web.resource import Resource
 from synapse.api.errors import Codes, HttpResponseException
 from synapse.api.ratelimiting import Ratelimiter
 from synapse.events import EventBase
+from synapse.http.client import ByteWriteable
 from synapse.http.types import QueryParams
 from synapse.logging.context import make_deferred_yieldable
 from synapse.media._base import FileInfo, ThumbnailInfo
@@ -60,7 +60,7 @@ from synapse.util import Clock
 
 from tests import unittest
 from tests.server import FakeChannel
-from tests.test_utils import SMALL_PNG
+from tests.test_utils import SMALL_CMYK_JPEG, SMALL_PNG, SMALL_PNG_SHA256
 from tests.unittest import override_config
 from tests.utils import default_config
 
@@ -187,6 +187,68 @@ small_png_with_transparency = TestImage(
     # different versions of Pillow.
 )
 
+small_cmyk_jpeg = TestImage(
+    SMALL_CMYK_JPEG,
+    b"image/jpeg",
+    b".jpeg",
+    # These values were sourced simply by seeing at what the tests produced at
+    # the time of writing. If this changes, the tests will fail.
+    unhexlify(
+        b"ffd8ffe000104a46494600010100000100010000ffdb00430006"
+        b"040506050406060506070706080a100a0a09090a140e0f0c1017"
+        b"141818171416161a1d251f1a1b231c1616202c20232627292a29"
+        b"191f2d302d283025282928ffdb0043010707070a080a130a0a13"
+        b"281a161a28282828282828282828282828282828282828282828"
+        b"2828282828282828282828282828282828282828282828282828"
+        b"2828ffc00011080020002003012200021101031101ffc4001f00"
+        b"0001050101010101010000000000000000010203040506070809"
+        b"0a0bffc400b5100002010303020403050504040000017d010203"
+        b"00041105122131410613516107227114328191a1082342b1c115"
+        b"52d1f02433627282090a161718191a25262728292a3435363738"
+        b"393a434445464748494a535455565758595a636465666768696a"
+        b"737475767778797a838485868788898a92939495969798999aa2"
+        b"a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9ca"
+        b"d2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7"
+        b"f8f9faffc4001f01000301010101010101010100000000000001"
+        b"02030405060708090a0bffc400b5110002010204040304070504"
+        b"0400010277000102031104052131061241510761711322328108"
+        b"144291a1b1c109233352f0156272d10a162434e125f11718191a"
+        b"262728292a35363738393a434445464748494a53545556575859"
+        b"5a636465666768696a737475767778797a82838485868788898a"
+        b"92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9"
+        b"bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8"
+        b"e9eaf2f3f4f5f6f7f8f9faffda000c03010002110311003f00fa"
+        b"a68a28a0028a28a0028a28a0028a28a00fffd9"
+    ),
+    unhexlify(
+        b"ffd8ffe000104a46494600010100000100010000ffdb00430006"
+        b"040506050406060506070706080a100a0a09090a140e0f0c1017"
+        b"141818171416161a1d251f1a1b231c1616202c20232627292a29"
+        b"191f2d302d283025282928ffdb0043010707070a080a130a0a13"
+        b"281a161a28282828282828282828282828282828282828282828"
+        b"2828282828282828282828282828282828282828282828282828"
+        b"2828ffc00011080001000103012200021101031101ffc4001f00"
+        b"0001050101010101010000000000000000010203040506070809"
+        b"0a0bffc400b5100002010303020403050504040000017d010203"
+        b"00041105122131410613516107227114328191a1082342b1c115"
+        b"52d1f02433627282090a161718191a25262728292a3435363738"
+        b"393a434445464748494a535455565758595a636465666768696a"
+        b"737475767778797a838485868788898a92939495969798999aa2"
+        b"a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9ca"
+        b"d2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7"
+        b"f8f9faffc4001f01000301010101010101010100000000000001"
+        b"02030405060708090a0bffc400b5110002010204040304070504"
+        b"0400010277000102031104052131061241510761711322328108"
+        b"144291a1b1c109233352f0156272d10a162434e125f11718191a"
+        b"262728292a35363738393a434445464748494a53545556575859"
+        b"5a636465666768696a737475767778797a82838485868788898a"
+        b"92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9"
+        b"bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8"
+        b"e9eaf2f3f4f5f6f7f8f9faffda000c03010002110311003f00fa"
+        b"a68a28a00fffd9"
+    ),
+)
+
 small_lossless_webp = TestImage(
     unhexlify(
         b"524946461a000000574542505650384c0d0000002f0000001007" b"1011118888fe0700"
@@ -261,7 +323,7 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             """A mock for MatrixFederationHttpClient.get_file."""
 
             def write_to(
-                r: Tuple[bytes, Tuple[int, Dict[bytes, List[bytes]]]]
+                r: Tuple[bytes, Tuple[int, Dict[bytes, List[bytes]]]],
             ) -> Tuple[int, Dict[bytes, List[bytes]]]:
                 data, response = r
                 output_stream.write(data)
@@ -357,6 +419,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
 
         return channel
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_handle_missing_content_type(self) -> None:
         channel = self._req(
             b"attachment; filename=out" + self.test_image.extension,
@@ -368,6 +435,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             headers.getRawHeaders(b"Content-Type"), [b"application/octet-stream"]
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_disposition_filename_ascii(self) -> None:
         """
         If the filename is filename=<ascii> then Synapse will decode it as an
@@ -388,6 +460,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             ],
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_disposition_filenamestar_utf8escaped(self) -> None:
         """
         If the filename is filename=*utf8''<utf8 escaped> then Synapse will
@@ -413,6 +490,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             ],
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_disposition_none(self) -> None:
         """
         If there is no filename, Content-Disposition should only
@@ -429,6 +511,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             [b"inline" if self.test_image.is_inline else b"attachment"],
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_thumbnail_crop(self) -> None:
         """Test that a cropped remote thumbnail is available."""
         self._test_thumbnail(
@@ -438,6 +525,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             unable_to_thumbnail=self.test_image.unable_to_thumbnail,
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_thumbnail_scale(self) -> None:
         """Test that a scaled remote thumbnail is available."""
         self._test_thumbnail(
@@ -447,6 +539,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             unable_to_thumbnail=self.test_image.unable_to_thumbnail,
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_invalid_type(self) -> None:
         """An invalid thumbnail type is never available."""
         self._test_thumbnail(
@@ -457,7 +554,10 @@ class MediaRepoTests(unittest.HomeserverTestCase):
         )
 
     @unittest.override_config(
-        {"thumbnail_sizes": [{"width": 32, "height": 32, "method": "scale"}]}
+        {
+            "thumbnail_sizes": [{"width": 32, "height": 32, "method": "scale"}],
+            "enable_authenticated_media": False,
+        },
     )
     def test_no_thumbnail_crop(self) -> None:
         """
@@ -471,7 +571,10 @@ class MediaRepoTests(unittest.HomeserverTestCase):
         )
 
     @unittest.override_config(
-        {"thumbnail_sizes": [{"width": 32, "height": 32, "method": "crop"}]}
+        {
+            "thumbnail_sizes": [{"width": 32, "height": 32, "method": "crop"}],
+            "enable_authenticated_media": False,
+        }
     )
     def test_no_thumbnail_scale(self) -> None:
         """
@@ -484,6 +587,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             unable_to_thumbnail=self.test_image.unable_to_thumbnail,
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_thumbnail_repeated_thumbnail(self) -> None:
         """Test that fetching the same thumbnail works, and deleting the on disk
         thumbnail regenerates it.
@@ -658,6 +766,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             )
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_x_robots_tag_header(self) -> None:
         """
         Tests that the `X-Robots-Tag` header is present, which informs web crawlers
@@ -671,6 +784,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             [b"noindex, nofollow, noarchive, noimageindex"],
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_cross_origin_resource_policy_header(self) -> None:
         """
         Test that the Cross-Origin-Resource-Policy header is set to "cross-origin"
@@ -685,6 +803,11 @@ class MediaRepoTests(unittest.HomeserverTestCase):
             [b"cross-origin"],
         )
 
+    @unittest.override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     def test_unknown_v3_endpoint(self) -> None:
         """
         If the v3 endpoint fails, try the r0 one.
@@ -923,6 +1046,11 @@ class RemoteDownloadLimiterTestCase(unittest.HomeserverTestCase):
         d.callback(52428800)
         return d
 
+    @override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
     @patch(
         "synapse.http.matrixfederationclient.read_body_with_max_size",
         read_body_with_max_size_30MiB,
@@ -998,6 +1126,7 @@ class RemoteDownloadLimiterTestCase(unittest.HomeserverTestCase):
         {
             "remote_media_download_per_second": "50M",
             "remote_media_download_burst_count": "50M",
+            "enable_authenticated_media": False,
         }
     )
     @patch(
@@ -1057,7 +1186,12 @@ class RemoteDownloadLimiterTestCase(unittest.HomeserverTestCase):
         )
         assert channel.code == 200
 
-    @override_config({"remote_media_download_burst_count": "87M"})
+    @override_config(
+        {
+            "remote_media_download_burst_count": "87M",
+            "enable_authenticated_media": False,
+        }
+    )
     @patch(
         "synapse.http.matrixfederationclient.read_body_with_max_size",
         read_body_with_max_size_30MiB,
@@ -1097,7 +1231,7 @@ class RemoteDownloadLimiterTestCase(unittest.HomeserverTestCase):
         )
         assert channel2.code == 429
 
-    @override_config({"max_upload_size": "29M"})
+    @override_config({"max_upload_size": "29M", "enable_authenticated_media": False})
     @patch(
         "synapse.http.matrixfederationclient.read_body_with_max_size",
         read_body_with_max_size_30MiB,
@@ -1124,3 +1258,107 @@ class RemoteDownloadLimiterTestCase(unittest.HomeserverTestCase):
         )
         assert channel.code == 502
         assert channel.json_body["errcode"] == "M_TOO_LARGE"
+
+
+def read_body(
+    response: IResponse, stream: ByteWriteable, max_size: Optional[int]
+) -> Deferred:
+    d: Deferred = defer.Deferred()
+    stream.write(SMALL_PNG)
+    d.callback(len(SMALL_PNG))
+    return d
+
+
+class MediaHashesTestCase(unittest.HomeserverTestCase):
+    servlets = [
+        admin.register_servlets,
+        login.register_servlets,
+        media.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.user = self.register_user("user", "pass")
+        self.tok = self.login("user", "pass")
+        self.store = hs.get_datastores().main
+        self.client = hs.get_federation_http_client()
+
+    def create_resource_dict(self) -> Dict[str, Resource]:
+        resources = super().create_resource_dict()
+        resources["/_matrix/media"] = self.hs.get_media_repository_resource()
+        return resources
+
+    def test_ensure_correct_sha256(self) -> None:
+        """Check that the hash does not change"""
+        media = self.helper.upload_media(SMALL_PNG, tok=self.tok, expect_code=200)
+        mxc = media.get("content_uri")
+        assert mxc
+        store_media = self.get_success(self.store.get_local_media(mxc[11:]))
+        assert store_media
+        self.assertEqual(
+            store_media.sha256,
+            SMALL_PNG_SHA256,
+        )
+
+    def test_ensure_multiple_correct_sha256(self) -> None:
+        """Check that two media items have the same hash."""
+        media_a = self.helper.upload_media(SMALL_PNG, tok=self.tok, expect_code=200)
+        mxc_a = media_a.get("content_uri")
+        assert mxc_a
+        store_media_a = self.get_success(self.store.get_local_media(mxc_a[11:]))
+        assert store_media_a
+
+        media_b = self.helper.upload_media(SMALL_PNG, tok=self.tok, expect_code=200)
+        mxc_b = media_b.get("content_uri")
+        assert mxc_b
+        store_media_b = self.get_success(self.store.get_local_media(mxc_b[11:]))
+        assert store_media_b
+
+        self.assertNotEqual(
+            store_media_a.media_id,
+            store_media_b.media_id,
+        )
+        self.assertEqual(
+            store_media_a.sha256,
+            store_media_b.sha256,
+        )
+
+    @override_config(
+        {
+            "enable_authenticated_media": False,
+        }
+    )
+    # mock actually reading file body
+    @patch(
+        "synapse.http.matrixfederationclient.read_body_with_max_size",
+        read_body,
+    )
+    def test_ensure_correct_sha256_federated(self) -> None:
+        """Check that federated media have the same hash."""
+
+        # Mock getting a file over federation
+        async def _send_request(*args: Any, **kwargs: Any) -> IResponse:
+            resp = MagicMock(spec=IResponse)
+            resp.code = 200
+            resp.length = 500
+            resp.headers = Headers({"Content-Type": ["application/octet-stream"]})
+            resp.phrase = b"OK"
+            return resp
+
+        self.client._send_request = _send_request  # type: ignore
+
+        # first request should go through
+        channel = self.make_request(
+            "GET",
+            "/_matrix/media/v3/download/remote.org/abc",
+            shorthand=False,
+            access_token=self.tok,
+        )
+        assert channel.code == 200
+        store_media = self.get_success(
+            self.store.get_cached_remote_media("remote.org", "abc")
+        )
+        assert store_media
+        self.assertEqual(
+            store_media.sha256,
+            SMALL_PNG_SHA256,
+        )

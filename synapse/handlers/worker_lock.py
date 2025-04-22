@@ -19,6 +19,7 @@
 #
 #
 
+import logging
 import random
 from types import TracebackType
 from typing import (
@@ -183,7 +184,7 @@ class WorkerLocksHandler:
             return
 
         def _wake_all_locks(
-            locks: Collection[Union[WaitingLock, WaitingMultiLock]]
+            locks: Collection[Union[WaitingLock, WaitingMultiLock]],
         ) -> None:
             for lock in locks:
                 deferred = lock.deferred
@@ -269,6 +270,10 @@ class WaitingLock:
     def _get_next_retry_interval(self) -> float:
         next = self._retry_interval
         self._retry_interval = max(5, next * 2)
+        if self._retry_interval > 5 * 2 ^ 7:  # ~10 minutes
+            logging.warning(
+                f"Lock timeout is getting excessive: {self._retry_interval}s. There may be a deadlock."
+            )
         return next * random.uniform(0.9, 1.1)
 
 
@@ -344,4 +349,8 @@ class WaitingMultiLock:
     def _get_next_retry_interval(self) -> float:
         next = self._retry_interval
         self._retry_interval = max(5, next * 2)
+        if self._retry_interval > 5 * 2 ^ 7:  # ~10 minutes
+            logging.warning(
+                f"Lock timeout is getting excessive: {self._retry_interval}s. There may be a deadlock."
+            )
         return next * random.uniform(0.9, 1.1)

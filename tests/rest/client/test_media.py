@@ -24,14 +24,13 @@ import json
 import os
 import re
 import shutil
-from typing import Any, BinaryIO, Dict, List, Optional, Sequence, Tuple, Type
+from typing import Any, BinaryIO, ClassVar, Dict, List, Optional, Sequence, Tuple, Type
 from unittest.mock import MagicMock, Mock, patch
 from urllib import parse
 from urllib.parse import quote, urlencode
 
 from parameterized import parameterized, parameterized_class
 from PIL import Image as Image
-from typing_extensions import ClassVar
 
 from twisted.internet import defer
 from twisted.internet._resolver import HostResolution
@@ -66,6 +65,7 @@ from tests.media.test_media_storage import (
     SVG,
     TestImage,
     empty_file,
+    small_cmyk_jpeg,
     small_lossless_webp,
     small_png,
     small_png_with_transparency,
@@ -137,6 +137,7 @@ class MediaDomainBlockingTests(unittest.HomeserverTestCase):
                 time_now_ms=clock.time_msec(),
                 upload_name="test.png",
                 filesystem_id=file_id,
+                sha256=file_id,
             )
         )
         self.register_user("user", "password")
@@ -1916,6 +1917,7 @@ class RemoteDownloadLimiterTestCase(unittest.HomeserverTestCase):
 test_images = [
     small_png,
     small_png_with_transparency,
+    small_cmyk_jpeg,
     small_lossless_webp,
     empty_file,
     SVG,
@@ -1957,7 +1959,7 @@ class DownloadAndThumbnailTestCase(unittest.HomeserverTestCase):
             """A mock for MatrixFederationHttpClient.federation_get_file."""
 
             def write_to(
-                r: Tuple[bytes, Tuple[int, Dict[bytes, List[bytes]], bytes]]
+                r: Tuple[bytes, Tuple[int, Dict[bytes, List[bytes]], bytes]],
             ) -> Tuple[int, Dict[bytes, List[bytes]], bytes]:
                 data, response = r
                 output_stream.write(data)
@@ -1991,7 +1993,7 @@ class DownloadAndThumbnailTestCase(unittest.HomeserverTestCase):
             """A mock for MatrixFederationHttpClient.get_file."""
 
             def write_to(
-                r: Tuple[bytes, Tuple[int, Dict[bytes, List[bytes]]]]
+                r: Tuple[bytes, Tuple[int, Dict[bytes, List[bytes]]]],
             ) -> Tuple[int, Dict[bytes, List[bytes]]]:
                 data, response = r
                 output_stream.write(data)
@@ -2400,7 +2402,7 @@ class DownloadAndThumbnailTestCase(unittest.HomeserverTestCase):
 
             if expected_body is not None:
                 self.assertEqual(
-                    channel.result["body"], expected_body, channel.result["body"]
+                    channel.result["body"], expected_body, channel.result["body"].hex()
                 )
             else:
                 # ensure that the result is at least some valid image
@@ -2592,6 +2594,7 @@ class AuthenticatedMediaTestCase(unittest.HomeserverTestCase):
                 time_now_ms=self.clock.time_msec(),
                 upload_name="remote_test.png",
                 filesystem_id=file_id,
+                sha256=file_id,
             )
         )
 
@@ -2675,3 +2678,114 @@ class AuthenticatedMediaTestCase(unittest.HomeserverTestCase):
             access_token=self.tok,
         )
         self.assertEqual(channel10.code, 200)
+
+    def test_authenticated_media_etag(self) -> None:
+        """Test that ETag works correctly with authenticated media over client
+        APIs"""
+
+        # upload some local media with authentication on
+        channel = self.make_request(
+            "POST",
+            "_matrix/media/v3/upload?filename=test_png_upload",
+            SMALL_PNG,
+            self.tok,
+            shorthand=False,
+            content_type=b"image/png",
+            custom_headers=[("Content-Length", str(67))],
+        )
+        self.assertEqual(channel.code, 200)
+        res = channel.json_body.get("content_uri")
+        assert res is not None
+        uri = res.split("mxc://")[1]
+
+        # Check standard media endpoint
+        self._check_caching(f"/download/{uri}")
+
+        # check thumbnails as well
+        params = "?width=32&height=32&method=crop"
+        self._check_caching(f"/thumbnail/{uri}{params}")
+
+        # Inject a piece of remote media.
+        file_id = "abcdefg12345"
+        file_info = FileInfo(server_name="lonelyIsland", file_id=file_id)
+
+        media_storage = self.hs.get_media_repository().media_storage
+
+        ctx = media_storage.store_into_file(file_info)
+        (f, fname) = self.get_success(ctx.__aenter__())
+        f.write(SMALL_PNG)
+        self.get_success(ctx.__aexit__(None, None, None))
+
+        # we write the authenticated status when storing media, so this should pick up
+        # config and authenticate the media
+        self.get_success(
+            self.store.store_cached_remote_media(
+                origin="lonelyIsland",
+                media_id="52",
+                media_type="image/png",
+                media_length=1,
+                time_now_ms=self.clock.time_msec(),
+                upload_name="remote_test.png",
+                filesystem_id=file_id,
+                sha256=file_id,
+            )
+        )
+
+        # ensure we have thumbnails for the non-dynamic code path
+        if self.extra_config == {"dynamic_thumbnails": False}:
+            self.get_success(
+                self.repo._generate_thumbnails(
+                    "lonelyIsland", "52", file_id, "image/png"
+                )
+            )
+
+        self._check_caching("/download/lonelyIsland/52")
+
+        params = "?width=32&height=32&method=crop"
+        self._check_caching(f"/thumbnail/lonelyIsland/52{params}")
+
+    def _check_caching(self, path: str) -> None:
+        """
+        Checks that:
+          1. fetching the path returns an ETag header
+          2. refetching with the ETag returns a 304 without a body
+          3. refetching with the ETag but through unauthenticated endpoint
+             returns 404
+        """
+
+        # Request media over authenticated endpoint, should be found
+        channel1 = self.make_request(
+            "GET",
+            f"/_matrix/client/v1/media{path}",
+            access_token=self.tok,
+            shorthand=False,
+        )
+        self.assertEqual(channel1.code, 200)
+
+        # Should have a single ETag field
+        etags = channel1.headers.getRawHeaders("ETag")
+        self.assertIsNotNone(etags)
+        assert etags is not None  # For mypy
+        self.assertEqual(len(etags), 1)
+        etag = etags[0]
+
+        # Refetching with the etag should result in 304 and empty body.
+        channel2 = self.make_request(
+            "GET",
+            f"/_matrix/client/v1/media{path}",
+            access_token=self.tok,
+            shorthand=False,
+            custom_headers=[("If-None-Match", etag)],
+        )
+        self.assertEqual(channel2.code, 304)
+        self.assertEqual(channel2.is_finished(), True)
+        self.assertNotIn("body", channel2.result)
+
+        # Refetching with the etag but no access token should result in 404.
+        channel3 = self.make_request(
+            "GET",
+            f"/_matrix/media/r0{path}",
+            shorthand=False,
+            custom_headers=[("If-None-Match", etag)],
+        )
+        self.assertEqual(channel3.code, 404)

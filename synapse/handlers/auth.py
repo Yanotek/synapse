@@ -166,8 +166,7 @@ def login_id_phone_to_thirdparty(identifier: JsonDict) -> Dict[str, str]:
     if "country" not in identifier or (
         # The specification requires a "phone" field, while Synapse used to require a "number"
         # field. Accept both for backwards compatibility.
-        "phone" not in identifier
-        and "number" not in identifier
+        "phone" not in identifier and "number" not in identifier
     ):
         raise SynapseError(
             400, "Invalid phone-type identifier", errcode=Codes.INVALID_PARAM
@@ -1580,7 +1579,10 @@ class AuthHandler:
         # for the presence of an email address during password reset was
         # case sensitive).
         if medium == "email":
-            address = canonicalise_email(address)
+            try:
+                address = canonicalise_email(address)
+            except ValueError as e:
+                raise SynapseError(400, str(e))
 
         await self.store.user_add_threepid(
             user_id, medium, address, validated_at, self.hs.get_clock().time_msec()
@@ -1611,7 +1613,10 @@ class AuthHandler:
         """
         # 'Canonicalise' email addresses as per above
         if medium == "email":
-            address = canonicalise_email(address)
+            try:
+                address = canonicalise_email(address)
+            except ValueError as e:
+                raise SynapseError(400, str(e))
 
         await self.store.user_delete_threepid(user_id, medium, address)
 

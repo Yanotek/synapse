@@ -31,6 +31,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    TypedDict,
     cast,
 )
 
@@ -43,8 +44,6 @@ try:
     USE_ICU = True
 except ModuleNotFoundError:
     USE_ICU = False
-
-from typing_extensions import TypedDict
 
 from synapse.api.errors import StoreError
 from synapse.util.stringutils import non_null_str_or_none
@@ -224,9 +223,7 @@ class UserDirectoryBackgroundUpdateStore(StateDeltasStore):
                 SELECT room_id, events FROM %s
                 ORDER BY events DESC
                 LIMIT 250
-            """ % (
-                TEMP_TABLE + "_rooms",
-            )
+            """ % (TEMP_TABLE + "_rooms",)
             txn.execute(sql)
             rooms_to_work_on = cast(List[Tuple[str, int]], txn.fetchall())
 
@@ -1240,7 +1237,13 @@ def _parse_query_postgres(search_term: str) -> Tuple[str, str, str]:
     search_term = _filter_text_for_index(search_term)
 
     escaped_words = []
-    for word in _parse_words(search_term):
+    for index, word in enumerate(_parse_words(search_term)):
+        if index >= 10:
+            # We limit how many terms we include, as otherwise it can use
+            # excessive database time if people accidentally search for large
+            # strings.
+            break
+
         # Postgres tsvector and tsquery quoting rules:
         # words potentially containing punctuation should be quoted
         # and then existing quotes and backslashes should be doubled
