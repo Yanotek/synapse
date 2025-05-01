@@ -45,11 +45,19 @@ class DebugServlet(RestServlet):
             ):
                 stucked_deferreds += 1
 
+        notifier = self.hs.get_notifier()
+        empty_rooms = 0
+        for streams in notifier.room_to_user_streams.values():
+            if not streams:
+                empty_rooms += 1
+
         return (
             200,
             {
                 "top50": [str(i) for i in top_stats[:50]],
                 'stucked_deferreds': stucked_deferreds,
+                'empty_rooms': empty_rooms,
+                'all_rooms': len(notifier.room_to_user_streams)
             }
         )
 

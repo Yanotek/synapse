@@ -158,6 +158,8 @@ class _NotifierUserStream:
         for room in self.rooms:
             lst = notifier.room_to_user_streams.get(room, set())
             lst.discard(self)
+            if not lst:
+                notifier.room_to_user_streams.pop(room, None)
 
         notifier.user_to_user_stream.pop(self.user_id)
 
