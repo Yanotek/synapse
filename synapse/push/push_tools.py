@@ -21,7 +21,11 @@
 
 from synapse.api.constants import EventTypes, Membership
 from synapse.events import EventBase
-from synapse.push.presentable_names import calculate_room_name, name_from_member_event
+from synapse.push.presentable_names import (
+    calculate_room_alias,
+    calculate_room_name,
+    name_from_member_event,
+)
 from synapse.storage.controllers import StorageControllers
 from synapse.storage.databases.main import DataStore
 
@@ -106,6 +110,12 @@ async def get_context_for_event(
     )
     if name:
         ctx["name"] = name
+
+    room_alias = await calculate_room_alias(
+        storage.main, room_state_ids, user_id, fallback_to_single_member=False
+    )
+    if room_alias:
+        ctx["room_alias"] = room_alias
 
     sender_state_event_id = room_state_ids[("m.room.member", ev.sender)]
     sender_state_event = await storage.main.get_event(sender_state_event_id)
