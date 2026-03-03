@@ -727,14 +727,12 @@ def _is_membership_change_allowed(
                 errcode=Codes.INSUFFICIENT_POWER,
             )
         elif target_user_id != event.user_id:
-            kick_level = get_named_level(auth_events, "kick", 50)
-
-            if user_level < kick_level or user_level <= target_level:
-                raise UnstableSpecAuthError(
-                    403,
-                    "You cannot kick user %s." % target_user_id,
-                    errcode=Codes.INSUFFICIENT_POWER,
-                )
+            if not _is_one_on_one_room(auth_events):
+                kick_level = get_named_level(auth_events, "kick", 50)
+                if user_level < kick_level or (
+                    user_level < 100 and user_level <= target_level
+                ):
+                    raise AuthError(403, "You cannot kick user %s." % target_user_id)
     elif Membership.BAN == membership:
         if user_level < ban_level:
             raise UnstableSpecAuthError(
@@ -768,6 +766,16 @@ def _is_membership_change_allowed(
             raise AuthError(403, "You are banned from this room")
     else:
         raise AuthError(500, "Unknown membership %s" % membership)
+
+
+def _is_one_on_one_room(auth_events: StateMap["EventBase"]) -> bool:
+    members = [
+        state_key
+        for (event_type, state_key), event in auth_events.items()
+        if event_type == EventTypes.Member and event.membership == Membership.JOIN
+    ]
+
+    return len(members) == 2
 
 
 def _check_event_sender_in_room(
@@ -832,7 +840,11 @@ def _can_send_event(event: "EventBase", auth_events: StateMap["EventBase"]) -> b
     send_level = get_send_level(event.type, state_key, power_levels_event)
     user_level = get_user_power_level(event.user_id, auth_events)
 
-    if user_level < send_level:
+    if (
+        user_level < send_level
+        and event.type != "m.room.encryption"
+        and event.type != "m.room.request_calls_access"
+    ):
         raise UnstableSpecAuthError(
             403,
             "You don't have permission to post that to the room. "
@@ -973,8 +985,7 @@ def _check_power_levels(
                     raise SynapseError(400, f"{v!r} must be an integer.")
             if k in {"events", "notifications", "users"}:
                 if not isinstance(v, collections.abc.Mapping) or not all(
-                    type(v) is int
-                    for v in v.values()  # noqa: E721
+                    type(v) is int for v in v.values()  # noqa: E721
                 ):
                     raise SynapseError(
                         400,
