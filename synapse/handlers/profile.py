@@ -175,7 +175,7 @@ class ProfileHandler:
         new_displayname: str,
         by_admin: bool = False,
         deactivation: bool = False,
-        propagate: bool = True,
+        propagate: bool = False,
     ) -> None:
         """Set the displayname of a user
 
@@ -236,8 +236,8 @@ class ProfileHandler:
             target_user.to_string(), profile, by_admin, deactivation
         )
 
-        if propagate:
-            await self._update_join_states(requester, target_user)
+        # if propagate:
+        #     await self._update_join_states(requester, target_user)
 
     async def get_avatar_url(self, target_user: UserID) -> str | None:
         """
@@ -279,7 +279,7 @@ class ProfileHandler:
         new_avatar_url: str,
         by_admin: bool = False,
         deactivation: bool = False,
-        propagate: bool = True,
+        propagate: bool = False,
     ) -> None:
         """Set a new avatar URL for a user.
 
@@ -338,8 +338,8 @@ class ProfileHandler:
             target_user.to_string(), profile, by_admin, deactivation
         )
 
-        if propagate:
-            await self._update_join_states(requester, target_user)
+        # if propagate:
+        #     await self._update_join_states(requester, target_user)
 
     @cached()
     async def check_avatar_size_and_mime_type(self, mxc: str) -> bool:
@@ -368,9 +368,9 @@ class ProfileHandler:
             server_name = host
 
         if self._is_mine_server_name(server_name):
-            media_info: (
-                LocalMedia | RemoteMedia | None
-            ) = await self.store.get_local_media(media_id)
+            media_info: LocalMedia | RemoteMedia | None = (
+                await self.store.get_local_media(media_id)
+            )
         else:
             media_info = await self.store.get_cached_remote_media(server_name, media_id)
 
