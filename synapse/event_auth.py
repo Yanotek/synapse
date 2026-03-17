@@ -727,12 +727,14 @@ def _is_membership_change_allowed(
                 errcode=Codes.INSUFFICIENT_POWER,
             )
         elif target_user_id != event.user_id:
-            if not _is_one_on_one_room(auth_events):
-                kick_level = get_named_level(auth_events, "kick", 50)
-                if user_level < kick_level or (
-                    user_level < 100 and user_level <= target_level
-                ):
-                    raise AuthError(403, "You cannot kick user %s." % target_user_id)
+            kick_level = get_named_level(auth_events, "kick", 50)
+
+            if user_level < kick_level or user_level <= target_level:
+                raise UnstableSpecAuthError(
+                    403,
+                    "You cannot kick user %s." % target_user_id,
+                    errcode=Codes.INSUFFICIENT_POWER,
+                )
     elif Membership.BAN == membership:
         if user_level < ban_level:
             raise UnstableSpecAuthError(
@@ -767,15 +769,6 @@ def _is_membership_change_allowed(
     else:
         raise AuthError(500, "Unknown membership %s" % membership)
 
-
-def _is_one_on_one_room(auth_events: StateMap["EventBase"]) -> bool:
-    members = [
-        state_key
-        for (event_type, state_key), event in auth_events.items()
-        if event_type == EventTypes.Member and event.membership == Membership.JOIN
-    ]
-
-    return len(members) == 2
 
 
 def _check_event_sender_in_room(
